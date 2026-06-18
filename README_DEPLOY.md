@@ -1,6 +1,6 @@
 # Pravi Rental Streamlit App
 
-배포 시 Streamlit Cloud Secrets에 아래 값을 설정하세요.
+Streamlit Cloud Secrets에 아래 값을 설정하세요.
 
 SUPABASE_URL = "https://your-project.supabase.co"
 SUPABASE_SERVICE_KEY = "your-service-key"
