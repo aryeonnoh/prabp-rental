@@ -3,3 +3,6 @@ base = "light"
 
 [browser]
 gatherUsageStats = false
+
+[client]
+showErrorDetails = false
