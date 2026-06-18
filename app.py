@@ -816,7 +816,23 @@ def load_quotes_df(include_deleted=False):
     quote_ids = [int(x) for x in df["quote_id"].dropna().tolist()]
     item_rows = []
     for batch in chunked(quote_ids, 250):
-        item_rows.extend(supabase_client().table("quote_items").select("quote_id,product_name,local_thumbnail_path,thumbnail_url,id").in_("quote_id", batch).order("id").execute().data or [])
+        item_rows.extend(supabase_client().table("quote_items").select("quote_id,product_no,product_name,local_thumbnail_path,thumbnail_url,id").in_("quote_id", batch).order("id").execute().data or [])
+
+    # 오래된 quote_items에 thumbnail_url이 비어 있으면 products에서 한 번에 보강한다.
+    product_nos_for_thumb = sorted({str(r.get("product_no")) for r in item_rows if r.get("product_no") and not str(r.get("thumbnail_url") or "").strip()})
+    product_thumb_map = {}
+    for batch in chunked(product_nos_for_thumb, 250):
+        rows = supabase_client().table("products").select("product_no,thumbnail_url,local_thumbnail_path").in_("product_no", batch).execute().data or []
+        for p in rows:
+            product_thumb_map[str(p.get("product_no"))] = p
+
+    for r in item_rows:
+        if not str(r.get("thumbnail_url") or "").strip():
+            p = product_thumb_map.get(str(r.get("product_no")))
+            if p:
+                r["thumbnail_url"] = p.get("thumbnail_url", "") or ""
+                if not str(r.get("local_thumbnail_path") or "").strip():
+                    r["local_thumbnail_path"] = p.get("local_thumbnail_path", "") or ""
 
     grouped = {}
     for r in item_rows:
@@ -849,11 +865,67 @@ def get_quote(quote_id):
     return dict(data[0]) if data else None
 
 
+def fill_quote_item_image_fallbacks(df):
+    """quote_items에 썸네일 URL이 비어 있으면 products 테이블에서 보강한다.
+
+    로컬 SQLite에서 넘어온 오래된 견적 상품은 local_thumbnail_path만 있고
+    Streamlit Cloud에는 해당 파일이 없을 수 있다. 배포 환경에서는 URL을
+    우선 사용해야 하므로 products.thumbnail_url을 fallback으로 채운다.
+    """
+    if df.empty or "product_no" not in df.columns:
+        return df
+
+    if "thumbnail_url" not in df.columns:
+        df["thumbnail_url"] = ""
+    if "local_thumbnail_path" not in df.columns:
+        df["local_thumbnail_path"] = ""
+    if "size_text" not in df.columns:
+        df["size_text"] = ""
+    if "product_name" not in df.columns:
+        df["product_name"] = ""
+
+    need = df[
+        df["product_no"].notna()
+        & (
+            df["thumbnail_url"].fillna("").astype(str).str.strip().eq("")
+            | df["size_text"].fillna("").astype(str).str.strip().eq("")
+            | df["product_name"].fillna("").astype(str).str.strip().eq("")
+        )
+    ]
+    product_nos = [str(x) for x in need["product_no"].dropna().unique().tolist() if str(x)]
+    if not product_nos:
+        return df
+
+    product_map = {}
+    for batch in chunked(product_nos, 250):
+        rows = supabase_client().table("products").select(
+            "product_no,name,size_text,thumbnail_url,local_thumbnail_path"
+        ).in_("product_no", batch).execute().data or []
+        for r in rows:
+            product_map[str(r.get("product_no"))] = r
+
+    for idx, row in df.iterrows():
+        p = product_map.get(str(row.get("product_no")))
+        if not p:
+            continue
+        if not str(row.get("thumbnail_url") or "").strip():
+            df.at[idx, "thumbnail_url"] = p.get("thumbnail_url", "") or ""
+        if not str(row.get("local_thumbnail_path") or "").strip():
+            df.at[idx, "local_thumbnail_path"] = p.get("local_thumbnail_path", "") or ""
+        if not str(row.get("size_text") or "").strip():
+            df.at[idx, "size_text"] = p.get("size_text", "") or ""
+        if not str(row.get("product_name") or "").strip():
+            df.at[idx, "product_name"] = p.get("name", "") or ""
+    return df
+
+
 def load_quote_items_df(quote_id):
     rows = supabase_client().table("quote_items").select("*").eq("quote_id", int(quote_id)).order("id").execute().data or []
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["id", "quote_id", "product_no", "product_name", "size_text", "thumbnail_path", "thumbnail_url", "quantity", "unit_price", "line_total"])
+
+    df = fill_quote_item_image_fallbacks(df)
 
     if "local_thumbnail_path" in df.columns:
         df["thumbnail_path"] = df["local_thumbnail_path"].fillna("")
@@ -1151,14 +1223,37 @@ def update_quote_dates(quote_id, new_pickup, new_return):
 # -----------------------------
 
 def load_font(size=28, bold=False):
-    candidates = [
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
+    """한글 견적서용 폰트 로더.
+
+    Streamlit Community Cloud에서는 packages.txt의 fonts-noto-cjk 설치 후
+    보통 /usr/share/fonts/opentype/noto 경로에 CJK 폰트가 설치된다.
+    기존 trutype/noto 경로만 보면 한글이 빈칸으로 나올 수 있으므로
+    여러 경로를 순서대로 확인한다.
+    """
+    if bold:
+        candidates = [
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    else:
+        candidates = [
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
     for path in candidates:
         if os.path.exists(path):
             try:
@@ -1186,16 +1281,17 @@ def draw_fit_text(draw, xy, text, font, fill=(30, 30, 30), max_width=None):
 
 
 def open_thumb(path, fallback_url=""):
+    # 배포 환경에서는 로컬 thumbnails 폴더가 영구 저장되지 않으므로 URL을 우선 사용한다.
     try:
-        if path and os.path.exists(str(path)):
-            return Image.open(str(path)).convert("RGB")
+        if fallback_url:
+            r = requests.get(str(fallback_url), headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            return Image.open(BytesIO(r.content)).convert("RGB")
     except Exception:
         pass
     try:
-        if fallback_url:
-            r = requests.get(str(fallback_url), headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            return Image.open(BytesIO(r.content)).convert("RGB")
+        if path and os.path.exists(str(path)):
+            return Image.open(str(path)).convert("RGB")
     except Exception:
         pass
     return None
@@ -1337,22 +1433,25 @@ def quote_filename(quote_id, ext="png"):
 # -----------------------------
 
 def show_thumb_from_values(local_path="", url="", width=None):
+    if url:
+        try:
+            st.image(str(url), use_container_width=True)
+            return
+        except Exception:
+            pass
     try:
         if local_path and os.path.exists(str(local_path)):
             st.image(str(local_path), use_container_width=True)
             return
     except Exception:
         pass
-    if url:
-        try:
-            st.image(url, use_container_width=True)
-            return
-        except Exception:
-            pass
     st.caption("이미지 없음")
 
 
 def image_src_for_html(local_path="", url=""):
+    # 배포 환경에서는 thumbnail_url을 우선 사용한다.
+    if url:
+        return str(url or "")
     try:
         if local_path and os.path.exists(str(local_path)):
             ext = os.path.splitext(str(local_path))[1].lower().replace(".", "") or "jpg"
@@ -1363,7 +1462,7 @@ def image_src_for_html(local_path="", url=""):
             return f"data:image/{ext};base64,{b64}"
     except Exception:
         pass
-    return str(url or "")
+    return ""
 
 
 
@@ -2370,6 +2469,7 @@ def page_rentals():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
+APP_BUILD = "cloud-fix-20260618"
 require_app_password()
 
 st.markdown("""
