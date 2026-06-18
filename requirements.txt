@@ -1,8 +1,0 @@
-streamlit
-pandas
-pillow
-requests
-beautifulsoup4
-supabase==2.31.0
-reportlab
-openpyxl
