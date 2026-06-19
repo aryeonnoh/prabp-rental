@@ -340,7 +340,7 @@ def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
     update_quote_date_range_from_items(quote_id)
     update_quote_totals(quote_id, reprice=False)
     refresh_quote_return_status(int(quote_id))
-    clear_data_cache()
+    clear_quote_cache()
     return True, []
 
 def pricing_summary_text(pickup_date, return_date):
@@ -379,6 +379,26 @@ def clear_data_cache():
         st.cache_data.clear()
     except Exception:
         pass
+
+
+def clear_quote_cache():
+    """견적/대여 관련 캐시만 비운다.
+
+    상품 페이지 캐시는 유지해서 버튼 클릭 후 반응 속도를 줄인다.
+    상품 동기화나 가격 CSV 반영처럼 products가 바뀌는 작업은 기존 clear_data_cache()를 사용한다.
+    """
+    for name in [
+        "load_quotes_df",
+        "bulk_product_status",
+        "cached_quote_png_bytes",
+        "cached_quote_pdf_bytes",
+    ]:
+        fn = globals().get(name)
+        try:
+            if fn is not None and hasattr(fn, "clear"):
+                fn.clear()
+        except Exception:
+            pass
 
 
 def table_all(table_name, select="*", order_col=None, desc=False, page_size=1000):
@@ -1002,7 +1022,7 @@ def reopen_quote_for_edit(quote_id):
             "status": "견적중",
             "updated_at": datetime.now().isoformat(),
         }).eq("quote_id", int(quote_id)).execute()
-        clear_data_cache()
+        clear_quote_cache()
         return True, "확정 상태를 해제하고 견적중으로 전환했습니다."
     if status in ["부분반납", "반납완료"]:
         return False, "반납이 시작된 견적서는 상품 구성이나 견적 정보를 수정할 수 없습니다."
@@ -1035,7 +1055,7 @@ def update_quote_header(quote_id, team_name, pickup_date, return_date):
     }).eq("quote_id", int(quote_id)).execute()
     set_all_quote_item_dates(quote_id, pickup, ret, reprice=True)
     update_quote_totals(quote_id, reprice=True)
-    clear_data_cache()
+    clear_quote_cache()
     return True, ([message] if message else [])
 
 
@@ -1088,7 +1108,7 @@ def update_quote_totals(quote_id, reprice=True, clear_cache=True):
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
     if clear_cache:
-        clear_data_cache()
+        clear_quote_cache()
 
 
 def recalculate_open_quotes_for_holidays():
@@ -1147,7 +1167,7 @@ def create_quote(team_name, pickup_date, return_date, selected_items, memo=""):
         client.table("quote_items").insert(rows).execute()
 
     update_quote_totals(quote_id, reprice=False)
-    clear_data_cache()
+    clear_quote_cache()
     return quote_id
 
 
@@ -1339,7 +1359,7 @@ def add_item_to_quote(quote_id, product_no, quantity=1):
         }).execute()
 
     update_quote_totals(quote_id, reprice=False)
-    clear_data_cache()
+    clear_quote_cache()
     return True, message or "상품을 추가했습니다."
 
 
@@ -1349,7 +1369,7 @@ def delete_quote_item(item_id, quote_id):
         return False, message
     supabase_client().table("quote_items").delete().eq("id", int(item_id)).eq("quote_id", int(quote_id)).execute()
     update_quote_totals(quote_id, reprice=False)
-    clear_data_cache()
+    clear_quote_cache()
     return True, message or "상품을 삭제했습니다."
 
 
@@ -1380,7 +1400,7 @@ def update_quote_item(item_id, quantity, unit_price):
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
     update_quote_totals(quote_id, reprice=False)
-    clear_data_cache()
+    clear_quote_cache()
     return True, message or "상품 정보를 변경했습니다."
 
 
@@ -1449,7 +1469,7 @@ def confirm_quote(quote_id):
         client.table("rentals").insert(rental_rows).execute()
 
     client.table("quotes").update({"status": "확정", "updated_at": datetime.now().isoformat()}).eq("quote_id", int(quote_id)).execute()
-    clear_data_cache()
+    clear_quote_cache()
     return True, []
 
 
@@ -1457,7 +1477,7 @@ def delete_quote(quote_id):
     client = supabase_client()
     client.table("quotes").update({"status": "삭제", "updated_at": datetime.now().isoformat()}).eq("quote_id", int(quote_id)).execute()
     client.table("rentals").update({"status": "삭제", "updated_at": datetime.now().isoformat()}).eq("quote_id", int(quote_id)).execute()
-    clear_data_cache()
+    clear_quote_cache()
 
 
 def load_rentals_for_quote_df(quote_id):
@@ -1494,6 +1514,7 @@ def return_rental_items(quote_id, rental_ids):
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).in_("id", ids).execute()
     refresh_quote_return_status(quote_id)
+    clear_quote_cache()
     return True, "선택 상품을 반납 처리했습니다."
 
 
@@ -1506,6 +1527,7 @@ def return_quote(quote_id):
             "updated_at": datetime.now().isoformat(),
         }).eq("quote_id", int(quote_id)).eq("status", status).execute()
     refresh_quote_return_status(quote_id)
+    clear_quote_cache()
 
 
 def set_rental_item_returned(rental_id, returned=True):
@@ -1520,6 +1542,7 @@ def set_rental_item_returned(rental_id, returned=True):
         data.update({"status": "대여중", "returned_at": None})
     supabase_client().table("rentals").update(data).eq("id", int(rental_id)).execute()
     refresh_quote_return_status(int(rental["quote_id"]))
+    clear_quote_cache()
     return True, "반납 상태를 변경했습니다."
 
 
@@ -2960,15 +2983,16 @@ def page_quote_create():
     st.header("견적서 만들기")
     st.caption("* 필수 입력")
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1.15, 1.15])
-    with c1:
-        team_name = st.text_input("팀", key="create_team_name", placeholder="팀 이름 입력")
-    with c2:
-        person_name = st.text_input("사람", key="create_person_name", placeholder="사람 이름 입력")
-    with c3:
-        pickup_raw = st.text_input("픽업 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_pickup_text")
-    with c4:
-        return_raw = st.text_input("반납 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_return_text")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([1, 1, 1.15, 1.15])
+        with c1:
+            team_name = st.text_input("팀", key="create_team_name", placeholder="팀 이름 입력")
+        with c2:
+            person_name = st.text_input("사람", key="create_person_name", placeholder="사람 이름 입력")
+        with c3:
+            pickup_raw = st.text_input("픽업 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_pickup_text")
+        with c4:
+            return_raw = st.text_input("반납 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_return_text")
 
     pickup_date = try_normalize_date_text(pickup_raw)
     return_date = try_normalize_date_text(return_raw)
@@ -3031,6 +3055,18 @@ def page_quote_create():
     if not selected_items:
         st.info("선택된 상품이 없습니다.")
     else:
+        with st.container(border=True):
+            st.markdown("**견적 정보**")
+            info_cols = st.columns(4)
+            info_cols[0].caption("팀")
+            info_cols[0].write(team_name or "-")
+            info_cols[1].caption("사람")
+            info_cols[1].write(person_name or "-")
+            info_cols[2].caption("픽업 날짜")
+            info_cols[2].write(pickup_date or "-")
+            info_cols[3].caption("반납 날짜")
+            info_cols[3].write(return_date or "-")
+            st.caption("상단 입력값과 자동으로 동기화됩니다. 수정은 상단 입력란에서 해주세요.")
         selected_codes = tuple(str(x) for x in selected_items.keys())
         selected_status = bulk_product_status(selected_codes, pickup_date or "", return_date or "", 0)
         selected_product_map = load_products_map(selected_codes)
@@ -3231,15 +3267,17 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                     unit = st.number_input("단가", min_value=0, value=safe_int(item["unit_price"], 0), step=1000, key=f"{key_prefix}_price_{item['id']}")
                     st.caption(f"적용 {item_multiplier}배")
                     st.caption(f"금액: {money(calculate_line_total(qty, unit, item_pickup, item_return, multiplier=item_multiplier))}")
+                changed_item_values = (
+                    safe_int(qty, 1) != safe_int(item["quantity"], 1)
+                    or safe_int(unit, 0) != safe_int(item["unit_price"], 0)
+                )
+                if changed_item_values:
+                    ok, msg = update_quote_item(item["id"], qty, unit)
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(msg)
                 with c5:
-                    if st.button("변경 저장", key=f"{key_prefix}_save_item_{item['id']}", use_container_width=True):
-                        ok, msg = update_quote_item(item["id"], qty, unit)
-                        if ok:
-                            if msg:
-                                st.info(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
                     if st.button("날짜 수정", key=f"{key_prefix}_date_item_{item['id']}", use_container_width=True):
                         if quote_item_date_dialog is not None:
                             quote_item_date_dialog(int(item["id"]), int(quote_id))
@@ -3332,8 +3370,6 @@ def combined_quote_list_card(row, key_prefix="combined"):
 
 
 def page_quote_history():
-    st.header("견적서 조회/반납 기록")
-
     detail_id = st.session_state.get("combined_detail_id")
     if detail_id:
         if st.button("‹ 목록으로", key="combined_back"):
@@ -3342,6 +3378,7 @@ def page_quote_history():
         render_quote_detail(int(detail_id), allow_edit=True, key_prefix="combined_detail")
         return
 
+    st.header("견적서 조회/반납 기록")
     quotes = load_quotes_df(include_deleted=False)
     if quotes.empty:
         st.info("저장된 견적서가 없습니다.")
@@ -3418,7 +3455,7 @@ def page_quote_history():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "cloud-fix-20260619-item-date-pricing-v2"
+APP_BUILD = "cloud-fix-20260619-fast-detail-v2"
 require_app_password()
 
 st.markdown("""
