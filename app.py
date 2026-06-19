@@ -287,9 +287,9 @@ def set_all_quote_item_dates(quote_id, pickup_date, return_date, reprice=True):
 def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
     """견적 상품 하나의 날짜를 수정하고 해당 날짜 기준으로 가격을 다시 계산한다.
 
-    확정/부분반납 상태에서 활성 대여가 있는 상품이면 별도 반납 카드로 다시 만들지 않고,
-    같은 상품의 활성 rentals 날짜도 같이 수정한다. 이 경우 견적 상태는 유지한다.
-    수량/가격/제품 구성 변경은 기존처럼 reopen_quote_for_edit 쪽에서 견적중으로 돌린다.
+    모든 상태에서 날짜 수정이 가능하다. 단, 수정이 발생하면 기존 대여 기록을 해제하고
+    견적중 상태로 전환한다. 상품별 연박이 다를 수 있으므로 해당 상품 금액과 견적 총액을
+    다시 계산한다.
     """
     try:
         pickup = normalize_date_text(pickup_date)
@@ -314,34 +314,27 @@ def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
     if qty > total_qty:
         return False, [f"보유수량이 {total_qty}개입니다."]
 
-    # 확정/부분반납 상태에서는 같은 견적의 활성 대여를 제외하고 날짜 충돌을 검사한다.
     status_one = bulk_product_status((product_no,), pickup, ret, int(quote_id)).get(product_no, {})
     reserved = safe_int(status_one.get("reserved", 0), 0)
     if total_qty - reserved < qty:
         return False, [f"{item.get('product_name', product_no)}은 해당 날짜에 다른 대여와 겹칩니다. 필요 {qty}개 / 가능 {max(total_qty - reserved, 0)}개"]
 
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, [message]
+
     line_total = calculate_line_total(qty, safe_int(item.get("unit_price", 0), 0), pickup, ret)
-    client = supabase_client()
-    client.table("quote_items").update({
+    supabase_client().table("quote_items").update({
         "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
         "line_total": line_total,
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
 
-    # 확정/부분반납 상태에서 아직 반납되지 않은 해당 상품의 rentals 날짜도 같이 수정한다.
-    if str(quote.get("status")) in ["확정", "부분반납"]:
-        for active_status in ACTIVE_RENTAL_STATUSES:
-            client.table("rentals").update({
-                "pickup_date": pickup,
-                "return_date": ret,
-                "updated_at": datetime.now().isoformat(),
-            }).eq("quote_id", int(quote_id)).eq("product_no", product_no).eq("status", active_status).execute()
-
     update_quote_date_range_from_items(quote_id)
     update_quote_totals(quote_id, reprice=False)
-    refresh_quote_return_status(int(quote_id))
     clear_quote_cache()
-    return True, []
+    return True, ([message] if message else [])
+
 
 def pricing_summary_text(pickup_date, return_date):
     try:
@@ -1005,27 +998,30 @@ def status_filter_control(label, options, key):
 
 
 def reopen_quote_for_edit(quote_id):
-    """확정 견적을 수정할 때 기존 활성 대여를 해제하고 견적중으로 되돌린다."""
+    """견적 내용을 수정할 때 기존 대여 상태를 해제하고 견적중으로 되돌린다.
+
+    확정/부분반납/반납완료 상태라도 수량, 단가, 상품 구성, 기본 정보, 상품별 날짜를
+    수정하면 다시 견적중 상태로 돌아간다. 기존 rentals 행은 삭제 상태로 보존해
+    재고를 막지 않게 처리한다.
+    """
     quote = get_quote(quote_id)
     if not quote:
         return False, "견적서를 찾지 못했습니다."
     status = str(quote.get("status", ""))
     if status == "견적중":
         return True, ""
-    if status == "확정":
+    if status in ["확정", "부분반납", "반납완료"]:
         client = supabase_client()
         client.table("rentals").update({
             "status": "삭제",
             "updated_at": datetime.now().isoformat(),
-        }).eq("quote_id", int(quote_id)).in_("status", list(ACTIVE_RENTAL_STATUSES)).execute()
+        }).eq("quote_id", int(quote_id)).neq("status", "삭제").execute()
         client.table("quotes").update({
             "status": "견적중",
             "updated_at": datetime.now().isoformat(),
         }).eq("quote_id", int(quote_id)).execute()
         clear_quote_cache()
-        return True, "확정 상태를 해제하고 견적중으로 전환했습니다."
-    if status in ["부분반납", "반납완료"]:
-        return False, "반납이 시작된 견적서는 상품 구성이나 견적 정보를 수정할 수 없습니다."
+        return True, "수정 내용 반영을 위해 견적중 상태로 전환했습니다."
     return False, "현재 상태에서는 견적서를 수정할 수 없습니다."
 
 
@@ -1570,11 +1566,14 @@ def get_rental_item(rental_id):
 
 
 def update_rental_item_dates(rental_id, new_pickup, new_return):
+    """기존 대여 상품 날짜 수정 진입점.
+
+    이제 대여 상태에서 날짜를 수정하면 해당 견적을 견적중으로 전환하고,
+    연결된 견적 상품 날짜/금액을 수정한다.
+    """
     rental = get_rental_item(rental_id)
     if not rental:
         return False, ["대여 상품을 찾지 못했습니다."]
-    if rental.get("status") == "반납완료":
-        return False, ["이미 반납완료된 상품은 날짜를 수정하지 않습니다."]
     try:
         pickup = normalize_date_text(new_pickup)
         ret = normalize_date_text(new_return)
@@ -1583,38 +1582,12 @@ def update_rental_item_dates(rental_id, new_pickup, new_return):
     if ret < pickup:
         return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
 
-    product = get_product(rental["product_no"]) or {}
-    total_qty = max(safe_int(product.get("qty", 1), 1), 1)
-    qty = max(safe_int(rental.get("quantity", 1), 1), 1)
-    conflicts = rentals_query(
-        product_no=rental["product_no"],
-        pickup_date=pickup,
-        return_date=ret,
-        active_only=True,
-        exclude_rental_id=int(rental_id),
-    )
-    reserved = sum(safe_int(r.get("quantity", 0), 0) for r in conflicts)
-    if total_qty - reserved < qty:
-        return False, [f"{rental['product_name']}은 해당 날짜에 다른 대여와 겹칩니다."]
-
-    supabase_client().table("rentals").update({
-        "pickup_date": pickup,
-        "return_date": ret,
-        "updated_at": datetime.now().isoformat(),
-    }).eq("id", int(rental_id)).execute()
-    # 같은 견적/상품의 견적 상품 날짜와 금액도 같이 갱신한다.
-    qi_rows = supabase_client().table("quote_items").select("id,quantity,unit_price,availability_note").eq("quote_id", int(rental["quote_id"])).eq("product_no", str(rental["product_no"])).execute().data or []
-    for qi in qi_rows:
-        line_total = calculate_line_total(qi.get("quantity", 1), qi.get("unit_price", 0), pickup, ret)
-        supabase_client().table("quote_items").update({
-            "availability_note": make_item_note(pickup, ret, qi.get("availability_note", "")),
-            "line_total": line_total,
-            "updated_at": datetime.now().isoformat(),
-        }).eq("id", int(qi["id"])).execute()
-    update_quote_date_range_from_rentals(int(rental["quote_id"]))
-    refresh_quote_return_status(int(rental["quote_id"]))
-    clear_data_cache()
-    return True, []
+    quote_id = int(rental["quote_id"])
+    product_no = str(rental["product_no"])
+    qi_rows = supabase_client().table("quote_items").select("id").eq("quote_id", quote_id).eq("product_no", product_no).limit(1).execute().data or []
+    if not qi_rows:
+        return False, ["연결된 견적 상품을 찾지 못했습니다."]
+    return update_quote_item_dates(int(qi_rows[0]["id"]), quote_id, pickup, ret)
 
 
 def update_quote_dates(quote_id, new_pickup, new_return):
@@ -3166,8 +3139,9 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
         return
     items = load_quote_items_df(quote_id)
     status = str(quote.get("status", ""))
-    # 견적중은 자유 수정, 확정/부분반납은 활성 상품의 날짜/반납 조작을 같은 카드에서 처리한다.
-    composition_editable = status in ["견적중", "확정", "부분반납"]
+    # 삭제 상태가 아니면 모든 상태에서 수량/단가/날짜/상품 구성을 수정할 수 있다.
+    # 수정이 발생하면 자동으로 견적중 상태로 되돌린다.
+    composition_editable = status != "삭제"
 
     title_cols = st.columns([4, 2])
     with title_cols[0]:
@@ -3177,7 +3151,7 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     with title_cols[1]:
         top_buttons = st.columns(2)
         with top_buttons[0]:
-            if st.button("수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=status not in ["견적중", "확정"]):
+            if st.button("수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=status == "삭제"):
                 if quote_header_dialog is not None:
                     quote_header_dialog(quote_id)
         with top_buttons[1]:
@@ -3196,7 +3170,7 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     with product_head_cols[1]:
         action_buttons = st.columns(2)
         with action_buttons[0]:
-            if st.button("상품 추가", use_container_width=True, key=f"{key_prefix}_mid_add_{quote_id}", disabled=status not in ["견적중", "확정"]):
+            if st.button("상품 추가", use_container_width=True, key=f"{key_prefix}_mid_add_{quote_id}", disabled=status == "삭제"):
                 if quote_add_product_dialog is not None:
                     quote_add_product_dialog(quote_id)
         with action_buttons[1]:
@@ -3241,7 +3215,7 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
         returned_rental = next((r for r in related_rentals if str(r.get("status")) == "반납완료"), None)
         current_rental = active_rental or returned_rental
         item_returned = bool(returned_rental and not active_rental)
-        item_editable = composition_editable and not item_returned
+        item_editable = composition_editable
 
         with st.container(border=True):
             status_cols = st.columns([2.3, 3.7])
@@ -3303,7 +3277,7 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                                     st.rerun()
                                 else:
                                     st.error(msg)
-                    if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True, disabled=status not in ["견적중", "확정"]):
+                    if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True, disabled=status == "삭제"):
                         ok, msg = delete_quote_item(item["id"], quote_id)
                         if ok:
                             if msg:
@@ -3590,15 +3564,18 @@ menu = st.session_state["menu"]
 st.sidebar.divider()
 st.sidebar.caption(f"오늘 {date.today().strftime('%Y.%m.%d')}")
 if st.sidebar.button("휴일 캘린더", use_container_width=True, key="open_holiday_calendar"):
-    st.session_state["holiday_dialog_open"] = True
     st.session_state["holiday_draft_dates"] = sorted(get_holiday_dates())
-
-if st.session_state.get("holiday_dialog_open"):
     if holiday_calendar_dialog is not None:
         holiday_calendar_dialog()
     else:
-        with st.sidebar.expander("휴일 캘린더", expanded=True):
-            render_holiday_calendar_panel()
+        st.session_state["holiday_dialog_open"] = True
+
+# st.dialog의 X 닫기는 session_state를 바꾸지 않으므로, open 상태를 계속 들고 있으면
+# 다른 버튼을 눌렀을 때 휴일 캘린더가 다시 뜬다. 기본 dialog는 버튼 클릭 시에만 열고,
+# dialog 미지원 환경에서만 fallback expander 상태를 사용한다.
+if holiday_calendar_dialog is None and st.session_state.get("holiday_dialog_open"):
+    with st.sidebar.expander("휴일 캘린더", expanded=True):
+        render_holiday_calendar_panel()
 
 if st.sidebar.button("상품 동기화", use_container_width=True, key="open_sync_dialog"):
     st.session_state["sync_dialog_open"] = True
