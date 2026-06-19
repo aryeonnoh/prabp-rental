@@ -3466,9 +3466,8 @@ h1, h2, h3 {line-height:1.25 !important; overflow:visible !important; padding-to
 .sidebar-brand {font-size:52px; font-weight:950; letter-spacing:-1.5px; color:#111; margin:0 0 2px 0; line-height:1.02;}
 .sidebar-subtitle {font-size:14px; color:#555; margin:0 0 30px 0;}
 .sidebar-nav {display:flex; flex-direction:column; gap:14px; margin:18px 0 36px 0;}
-.sidebar-nav-item {display:block; padding:15px 16px; border:1.5px solid #D0D5DD; border-radius:18px; text-align:center; text-decoration:none !important; color:#2D3142 !important; font-weight:850; background:#fff; transition:all .15s ease;}
-.sidebar-nav-item:hover {border-color:#98A2B3; background:#F8FAFC; transform:translateY(-1px);}
-.sidebar-nav-item.active {background:#111827; color:#fff !important; border-color:#111827; box-shadow:0 8px 18px rgba(17,24,39,.10);}
+.sidebar-nav-active {display:block; padding:15px 16px; border:1.5px solid #111827; border-radius:18px; text-align:center; color:#fff !important; font-weight:850; background:#111827; box-shadow:0 8px 18px rgba(17,24,39,.10); margin:0 0 14px 0;}
+.sidebar-nav-spacer {height:8px;}
 [data-testid="stSegmentedControl"] {margin-bottom:18px;}
 [data-testid="stSegmentedControl"] button {border-radius:14px !important; min-height:44px !important; font-weight:750 !important;}
 .filter-label {font-size:15px; font-weight:700; color:#222; margin: 0 0 6px 0;}
@@ -3573,37 +3572,27 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 menu_options = ["견적서 만들기", "견적서 조회/반납 기록"]
-menu_slug_to_label = {"create": "견적서 만들기", "records": "견적서 조회/반납 기록"}
-menu_label_to_slug = {v: k for k, v in menu_slug_to_label.items()}
 
-# 사이드 메뉴는 동그라미 표시 대신 명확한 active 탭 스타일로 표시한다.
-try:
-    query_menu = st.query_params.get("menu", None)
-except Exception:
-    query_menu = None
-
-if isinstance(query_menu, list):
-    query_menu = query_menu[0] if query_menu else None
-
-if query_menu in menu_slug_to_label:
-    target_menu = menu_slug_to_label[query_menu]
-    if st.session_state.get("menu") != target_menu:
-        st.session_state["menu"] = target_menu
-        st.session_state["combined_detail_id"] = None
-        st.session_state["sync_dialog_open"] = False
-        st.session_state["sync_fallback_open"] = False
-        st.session_state["holiday_dialog_open"] = False
-elif st.session_state.get("menu") not in menu_options:
+# HTML 링크 href='?menu=...' 방식은 Streamlit Cloud에서 새 세션처럼 동작해
+# 메뉴를 누를 때마다 비밀번호 화면이 다시 나올 수 있다.
+# 따라서 메뉴 전환은 URL 이동 없이 session_state만 바꾸는 st.button 방식으로 처리한다.
+if st.session_state.get("menu") not in menu_options:
     st.session_state["menu"] = "견적서 만들기"
 
-menu = st.session_state["menu"]
-nav_html = ["<div class='sidebar-nav'>"]
 for opt in menu_options:
-    slug = menu_label_to_slug[opt]
-    active_cls = " active" if menu == opt else ""
-    nav_html.append(f"<a class='sidebar-nav-item{active_cls}' href='?menu={slug}' target='_self'>{opt}</a>")
-nav_html.append("</div>")
-st.sidebar.markdown("".join(nav_html), unsafe_allow_html=True)
+    if st.session_state["menu"] == opt:
+        st.sidebar.markdown(f"<div class='sidebar-nav-active'>{opt}</div>", unsafe_allow_html=True)
+    else:
+        if st.sidebar.button(opt, key=f"nav_btn_{opt}", use_container_width=True):
+            st.session_state["menu"] = opt
+            st.session_state["combined_detail_id"] = None
+            st.session_state["sync_dialog_open"] = False
+            st.session_state["sync_fallback_open"] = False
+            st.session_state["holiday_dialog_open"] = False
+            st.rerun()
+
+menu = st.session_state["menu"]
+st.sidebar.markdown("<div class='sidebar-nav-spacer'></div>", unsafe_allow_html=True)
 
 st.sidebar.divider()
 st.sidebar.caption(f"오늘 {date.today().strftime('%Y.%m.%d')}")
