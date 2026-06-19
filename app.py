@@ -981,20 +981,40 @@ def parse_date_text(value):
 # -----------------------------
 
 def status_filter_control(label, options, key):
+    """상태 필터를 버튼 나열 대신 탭/세그먼트 형태로 표시한다."""
     if key not in st.session_state:
         st.session_state[key] = ""
+
     st.caption(label)
-    cols = st.columns(len(options) + 1)
-    all_clicked = cols[0].button("전체", key=f"{key}_all", use_container_width=True)
-    if all_clicked:
-        st.session_state[key] = ""
-        st.rerun()
-    for i, opt in enumerate(options, start=1):
-        clicked = cols[i].button(opt, key=f"{key}_{opt}", use_container_width=True)
-        if clicked:
-            st.session_state[key] = opt
+    labels = ["전체"] + list(options)
+    current_value = st.session_state.get(key, "")
+    current_label = current_value if current_value else "전체"
+
+    # Streamlit 최신 버전에서는 segmented_control이 가장 명확한 탭 UI를 제공한다.
+    if hasattr(st, "segmented_control"):
+        selected_label = st.segmented_control(
+            "",
+            labels,
+            default=current_label if current_label in labels else "전체",
+            key=f"{key}_segmented",
+            label_visibility="collapsed",
+        )
+        new_value = "" if selected_label == "전체" else selected_label
+        if new_value != current_value:
+            st.session_state[key] = new_value
             st.rerun()
-    return st.session_state.get(key)
+        return st.session_state.get(key, "")
+
+    # 구버전 Streamlit fallback: 버튼으로 동작하되 active 상태가 텍스트로 드러나게 한다.
+    cols = st.columns(len(labels))
+    for i, label_text in enumerate(labels):
+        value = "" if label_text == "전체" else label_text
+        active = value == current_value
+        button_text = f"■ {label_text}" if active else label_text
+        if cols[i].button(button_text, key=f"{key}_tab_{label_text}", use_container_width=True):
+            st.session_state[key] = value
+            st.rerun()
+    return st.session_state.get(key, "")
 
 
 def reopen_quote_for_edit(quote_id):
@@ -3435,7 +3455,7 @@ def page_quote_history():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "cloud-fix-20260619-fast-detail-v2"
+APP_BUILD = "tabs-nav-v1"
 require_app_password()
 
 st.markdown("""
@@ -3443,8 +3463,14 @@ st.markdown("""
 .block-container {padding-top: 3rem; max-width: 1500px;}
 h1, h2, h3 {line-height:1.25 !important; overflow:visible !important; padding-top:.12em !important; padding-bottom:.08em !important;}
 [data-testid="stSidebar"] {background-color: #fbfbfb;}
-.sidebar-brand {font-size:48px; font-weight:950; letter-spacing:-1.5px; color:#111; margin:0 0 2px 0; line-height:1.05;}
+.sidebar-brand {font-size:52px; font-weight:950; letter-spacing:-1.5px; color:#111; margin:0 0 2px 0; line-height:1.02;}
 .sidebar-subtitle {font-size:14px; color:#555; margin:0 0 30px 0;}
+.sidebar-nav {display:flex; flex-direction:column; gap:14px; margin:18px 0 36px 0;}
+.sidebar-nav-item {display:block; padding:15px 16px; border:1.5px solid #D0D5DD; border-radius:18px; text-align:center; text-decoration:none !important; color:#2D3142 !important; font-weight:850; background:#fff; transition:all .15s ease;}
+.sidebar-nav-item:hover {border-color:#98A2B3; background:#F8FAFC; transform:translateY(-1px);}
+.sidebar-nav-item.active {background:#111827; color:#fff !important; border-color:#111827; box-shadow:0 8px 18px rgba(17,24,39,.10);}
+[data-testid="stSegmentedControl"] {margin-bottom:18px;}
+[data-testid="stSegmentedControl"] button {border-radius:14px !important; min-height:44px !important; font-weight:750 !important;}
 .filter-label {font-size:15px; font-weight:700; color:#222; margin: 0 0 6px 0;}
 .small-muted {color:#777; font-size:13px;}
 .focus-guard {position:fixed; left:-9999px; top:-9999px; opacity:0; width:1px; height:1px; pointer-events:none;}
@@ -3547,19 +3573,37 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 menu_options = ["견적서 만들기", "견적서 조회/반납 기록"]
-if st.session_state.get("menu") not in menu_options:
-    st.session_state["menu"] = "견적서 만들기"
+menu_slug_to_label = {"create": "견적서 만들기", "records": "견적서 조회/반납 기록"}
+menu_label_to_slug = {v: k for k, v in menu_slug_to_label.items()}
 
-for opt in menu_options:
-    label = f"● {opt}" if st.session_state["menu"] == opt else opt
-    if st.sidebar.button(label, key=f"nav_{opt}", use_container_width=True):
-        st.session_state["menu"] = opt
+# 사이드 메뉴는 동그라미 표시 대신 명확한 active 탭 스타일로 표시한다.
+try:
+    query_menu = st.query_params.get("menu", None)
+except Exception:
+    query_menu = None
+
+if isinstance(query_menu, list):
+    query_menu = query_menu[0] if query_menu else None
+
+if query_menu in menu_slug_to_label:
+    target_menu = menu_slug_to_label[query_menu]
+    if st.session_state.get("menu") != target_menu:
+        st.session_state["menu"] = target_menu
         st.session_state["combined_detail_id"] = None
         st.session_state["sync_dialog_open"] = False
         st.session_state["sync_fallback_open"] = False
         st.session_state["holiday_dialog_open"] = False
-        st.rerun()
+elif st.session_state.get("menu") not in menu_options:
+    st.session_state["menu"] = "견적서 만들기"
+
 menu = st.session_state["menu"]
+nav_html = ["<div class='sidebar-nav'>"]
+for opt in menu_options:
+    slug = menu_label_to_slug[opt]
+    active_cls = " active" if menu == opt else ""
+    nav_html.append(f"<a class='sidebar-nav-item{active_cls}' href='?menu={slug}' target='_self'>{opt}</a>")
+nav_html.append("</div>")
+st.sidebar.markdown("".join(nav_html), unsafe_allow_html=True)
 
 st.sidebar.divider()
 st.sidebar.caption(f"오늘 {date.today().strftime('%Y.%m.%d')}")
