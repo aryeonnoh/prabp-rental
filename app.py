@@ -453,7 +453,7 @@ def load_products_page(search_text="", page=1, page_size=30):
     end = min(start + page_size - 1, total - 1)
 
     data_query = client.table("products").select(select_cols)
-    data_query = apply_search(data_query).order("product_no", desc=True)
+    data_query = apply_search(data_query).order("updated_at", desc=True).order("product_no", desc=True)
     res = data_query.range(start, end).execute()
     rows = res.data or []
     return df_from_rows(rows, cols), total
@@ -2238,7 +2238,7 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="qu
             with st.container(border=True):
                 c1, c2, c3, c4, c5 = st.columns([1.1, 3, 1, 1.3, 0.8])
                 with c1:
-                    show_thumb_from_values(item.get("thumbnail_path", ""), "")
+                    show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
                 with c2:
                     st.markdown(f"**{item['product_name']}**")
                     st.caption(item.get("size_text", ""))
