@@ -1824,42 +1824,319 @@ def rental_list_card(row, key_prefix="rental"):
                 date_edit = st.button("날짜 수정", key=f"{key_prefix}_date_{row['quote_id']}", use_container_width=True)
     return detail, return_all, date_edit
 
+def cafe24_product_code_to_no(value):
+    """Cafe24 상품코드(P0000LPP 등)를 products.product_no 값으로 변환한다."""
+    code = clean_text(value).upper()
+    if not code:
+        return ""
+
+    # 이미 숫자 상품번호가 들어온 CSV도 허용한다.
+    if code.isdigit():
+        try:
+            return str(int(code))
+        except Exception:
+            return ""
+
+    if code.startswith("P"):
+        code = code[1:]
+
+    # Cafe24 상품코드의 앞쪽 0 패딩 제거 후 A=0 기준 26진수로 해석한다.
+    code = code.lstrip("0")
+    if not code or not re.fullmatch(r"[A-Z]+", code):
+        return ""
+
+    product_no = 0
+    for ch in code:
+        product_no = product_no * 26 + (ord(ch) - ord("A"))
+    return str(product_no)
+
+
+def parse_supply_price_value(value):
+    """120000.00, 120,000원 같은 값을 원 단위 정수로 정리한다."""
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if not text or text in {"-", ".", "-."}:
+        return 0
+    try:
+        return max(int(float(text)), 0)
+    except Exception:
+        return 0
+
+
+def read_cafe24_csv(uploaded_file):
+    """Cafe24 CSV를 UTF-8/CP949/EUC-KR 순서로 읽는다."""
+    raw = uploaded_file.getvalue()
+    errors = []
+    for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+        try:
+            df = pd.read_csv(
+                BytesIO(raw),
+                encoding=encoding,
+                dtype=str,
+                keep_default_na=False,
+            )
+            return df, encoding
+        except Exception as e:
+            errors.append(f"{encoding}: {e}")
+    raise ValueError("CSV 파일을 읽지 못했습니다. " + " / ".join(errors[:2]))
+
+
+def prepare_supply_price_import(uploaded_file):
+    """원본 Cafe24 CSV와 products 테이블을 비교해 공급가 변경 미리보기를 만든다."""
+    source_df, encoding = read_cafe24_csv(uploaded_file)
+
+    required = ["상품코드", "공급가"]
+    missing = [c for c in required if c not in source_df.columns]
+    if missing:
+        raise ValueError("필수 열이 없습니다: " + ", ".join(missing))
+
+    work = pd.DataFrame({
+        "source_row": range(2, len(source_df) + 2),
+        "cafe24_product_code": source_df["상품코드"].astype(str).str.strip(),
+        "csv_product_name": (
+            source_df["상품명"].astype(str).str.strip()
+            if "상품명" in source_df.columns
+            else ""
+        ),
+        "raw_supply_price": source_df["공급가"].astype(str).str.strip(),
+    })
+    work["product_no"] = work["cafe24_product_code"].map(cafe24_product_code_to_no)
+    work["new_price"] = work["raw_supply_price"].map(parse_supply_price_value)
+
+    invalid_code_count = int((work["product_no"] == "").sum())
+    zero_skipped_count = int((work["new_price"] <= 0).sum())
+
+    positive = work[(work["product_no"] != "") & (work["new_price"] > 0)].copy()
+    duplicate_extra_count = int(len(positive) - positive["product_no"].nunique())
+    positive = positive.drop_duplicates(subset=["product_no"], keep="last")
+
+    db_rows = table_all("products", select="product_no,name,price")
+    db_df = df_from_rows(db_rows, ["product_no", "name", "price"])
+    if db_df.empty:
+        db_df = pd.DataFrame(columns=["product_no", "db_product_name", "current_price", "db_exists"])
+    else:
+        db_df["product_no"] = db_df["product_no"].astype(str).str.strip()
+        db_df["db_product_name"] = db_df["name"].fillna("").astype(str)
+        db_df["current_price"] = db_df["price"].map(lambda v: safe_int(v, 0))
+        db_df["db_exists"] = True
+        db_df = db_df[["product_no", "db_product_name", "current_price", "db_exists"]]
+
+    preview = positive.merge(db_df, on="product_no", how="left")
+    if "db_exists" not in preview.columns:
+        preview["db_exists"] = False
+    preview["db_exists"] = preview["db_exists"].fillna(False).astype(bool)
+    preview["current_price"] = preview["current_price"].map(lambda v: safe_int(v, 0))
+    preview["changed"] = preview["db_exists"] & (preview["current_price"] != preview["new_price"])
+
+    def row_status(row):
+        if not row["db_exists"]:
+            return "DB 미매칭"
+        if row["changed"]:
+            return "변경 예정"
+        return "동일"
+
+    preview["status"] = preview.apply(row_status, axis=1)
+    status_rank = {"변경 예정": 0, "DB 미매칭": 1, "동일": 2}
+    preview["__rank"] = preview["status"].map(status_rank).fillna(9)
+    preview = preview.sort_values(["__rank", "product_no"]).drop(columns=["__rank"]).reset_index(drop=True)
+
+    return {
+        "encoding": encoding,
+        "source_count": int(len(source_df)),
+        "positive_unique_count": int(len(positive)),
+        "zero_skipped_count": zero_skipped_count,
+        "invalid_code_count": invalid_code_count,
+        "duplicate_extra_count": duplicate_extra_count,
+        "matched_count": int(preview["db_exists"].sum()) if not preview.empty else 0,
+        "unmatched_count": int((~preview["db_exists"]).sum()) if not preview.empty else 0,
+        "changed_count": int(preview["changed"].sum()) if not preview.empty else 0,
+        "same_count": int((preview["db_exists"] & ~preview["changed"]).sum()) if not preview.empty else 0,
+        "preview": preview,
+    }
+
+
+def apply_supply_price_updates(preview_df):
+    """미리보기 중 변경 예정 행만 products.price에 일괄 반영한다."""
+    changes = preview_df[preview_df["changed"]].copy()
+    if changes.empty:
+        return 0
+
+    # updated_at은 건드리지 않는다. 제품 조회 화면의 기존 정렬 순서를 유지하기 위함이다.
+    rows = [
+        {
+            "product_no": str(row["product_no"]),
+            "price": int(row["new_price"]),
+        }
+        for _, row in changes.iterrows()
+    ]
+
+    client = supabase_client()
+    updated = 0
+    for batch in chunked(rows, 300):
+        client.table("products").upsert(batch, on_conflict="product_no").execute()
+        updated += len(batch)
+
+    set_meta("last_supply_price_import_at", now_text())
+    clear_data_cache()
+    return updated
+
+
+def render_supply_price_import_panel():
+    st.write("Cafe24 상품 CSV의 **공급가가 0원보다 큰 상품만** 프로그램 DB의 기본 단가로 반영합니다.")
+    st.caption("0원 상품은 기존 DB 가격을 유지하며, DB에 없는 상품은 새로 만들지 않습니다. 기존 견적서 금액도 변경하지 않습니다.")
+
+    flash = st.session_state.pop("supply_price_import_flash", "")
+    if flash:
+        st.success(flash)
+
+    uploaded = st.file_uploader(
+        "Cafe24 상품 CSV 업로드",
+        type=["csv"],
+        key="supply_price_csv_upload",
+        help="Cafe24 상품관리에서 내려받은 원본 CSV를 그대로 선택하세요.",
+    )
+    if uploaded is None:
+        st.info("CSV를 선택하면 DB와 비교한 뒤, 실제 반영 전에 변경 목록을 보여줍니다.")
+        return
+
+    try:
+        result = prepare_supply_price_import(uploaded)
+    except Exception as e:
+        st.error(f"CSV 확인 실패: {e}")
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("CSV 전체", f"{result['source_count']:,}개")
+    m2.metric("0원 제외 후", f"{result['positive_unique_count']:,}개")
+    m3.metric("DB 매칭", f"{result['matched_count']:,}개")
+    m4.metric("변경 예정", f"{result['changed_count']:,}개")
+
+    st.caption(
+        f"인코딩: {result['encoding']} · 0원 제외 {result['zero_skipped_count']:,}개 · "
+        f"DB 미매칭 {result['unmatched_count']:,}개 · 동일 가격 {result['same_count']:,}개"
+    )
+    if result["invalid_code_count"]:
+        st.warning(f"상품코드를 해석하지 못한 행이 {result['invalid_code_count']:,}개 있습니다.")
+    if result["duplicate_extra_count"]:
+        st.warning(f"중복 상품번호 {result['duplicate_extra_count']:,}개는 CSV의 마지막 값을 사용합니다.")
+
+    preview = result["preview"]
+    if preview.empty:
+        st.warning("반영할 수 있는 공급가 데이터가 없습니다.")
+        return
+
+    view = preview[[
+        "status", "product_no", "cafe24_product_code", "csv_product_name",
+        "db_product_name", "current_price", "new_price"
+    ]].copy()
+    view.columns = ["상태", "상품번호", "Cafe24 상품코드", "CSV 상품명", "DB 상품명", "현재 단가", "새 단가"]
+
+    st.markdown("#### 반영 미리보기")
+    st.dataframe(view.head(500), use_container_width=True, hide_index=True, height=360)
+    if len(view) > 500:
+        st.caption("화면에는 앞 500개만 표시합니다. 아래 CSV 다운로드에는 전체 결과가 포함됩니다.")
+
+    export_bytes = view.to_csv(index=False).encode("utf-8-sig")
+    changed_backup = view[view["상태"] == "변경 예정"].copy()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "전체 비교표 다운로드",
+            data=export_bytes,
+            file_name=f"pravi_supply_price_preview_{today_yyyymmdd()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_supply_preview",
+        )
+    with c2:
+        st.download_button(
+            "반영 전 가격 백업 다운로드",
+            data=changed_backup.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"pravi_supply_price_backup_{today_yyyymmdd()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_supply_backup",
+        )
+
+    if result["unmatched_count"]:
+        unmatched_view = view[view["상태"] == "DB 미매칭"]
+        with st.expander(f"DB 미매칭 {result['unmatched_count']:,}개 보기"):
+            st.dataframe(unmatched_view, use_container_width=True, hide_index=True, height=260)
+
+    confirmed = st.checkbox(
+        f"변경 예정 {result['changed_count']:,}개의 단가를 products.price에 반영합니다.",
+        key="confirm_supply_price_import",
+    )
+
+    if result["changed_count"] <= 0:
+        st.info("현재 DB와 가격이 같아서 변경할 항목이 없습니다.")
+        return
+
+    if st.button(
+        "공급가 DB 반영 실행",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirmed,
+        key="apply_supply_price_import",
+    ):
+        try:
+            with st.spinner("공급가를 DB에 반영하는 중입니다..."):
+                updated = apply_supply_price_updates(preview)
+            # 이미 화면에서 선택해 둔 견적 상품은 예전 단가를 들고 있을 수 있으므로 비운다.
+            st.session_state["selected_quote_items"] = {}
+            st.session_state["supply_price_import_flash"] = (
+                f"완료: {updated:,}개 상품의 기본 단가를 업데이트했습니다. "
+                "새 견적부터 이 단가가 자동 입력됩니다."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"DB 반영 실패: {e}")
+
+
 def render_sync_panel():
-    st.write("사이트 카테고리 URL을 입력하고 상품을 프로그램 DB로 가져옵니다.")
-    base_url = st.text_input("가져올 카테고리 URL", value=DEFAULT_CATEGORY_URL, key="sync_url")
-    pages = st.number_input("가져올 페이지 수", min_value=1, max_value=200, value=1, step=1, key="sync_pages")
-    delay = st.number_input("페이지 사이 쉬는 시간(초)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sync_delay")
+    sync_tab, price_tab = st.tabs(["사이트 상품 동기화", "공급가 CSV 반영"])
 
-    if st.button("상품 동기화 시작", type="primary", key="sync_start"):
-        total = 0
-        total_added = 0
-        total_updated = 0
-        progress = st.progress(0)
-        log_box = st.empty()
-        debug_rows = []
+    with sync_tab:
+        st.write("사이트 카테고리 URL을 입력하고 상품을 프로그램 DB로 가져옵니다.")
+        base_url = st.text_input("가져올 카테고리 URL", value=DEFAULT_CATEGORY_URL, key="sync_url")
+        pages = st.number_input("가져올 페이지 수", min_value=1, max_value=200, value=1, step=1, key="sync_pages")
+        delay = st.number_input("페이지 사이 쉬는 시간(초)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sync_delay")
 
-        for page in range(1, int(pages) + 1):
-            page_url = set_page_param(base_url, page)
-            log_box.info(f"{page}페이지 가져오는 중: {page_url}")
-            try:
-                products, debug = parse_products_from_page(page_url)
-                added, updated = upsert_products(products)
-                total += len(products)
-                total_added += added
-                total_updated += updated
-                debug["page"] = page
-                debug["added"] = added
-                debug["updated"] = updated
-                debug_rows.append(debug)
-            except Exception as e:
-                st.error(f"{page}페이지 오류: {e}")
-            progress.progress(page / int(pages))
-            time.sleep(float(delay))
+        if st.button("상품 동기화 시작", type="primary", key="sync_start"):
+            total = 0
+            total_added = 0
+            total_updated = 0
+            progress = st.progress(0)
+            log_box = st.empty()
+            debug_rows = []
 
-        set_meta("last_sync_at", now_text())
-        st.success(f"동기화 완료: 총 {total}개 처리 / 새 상품 {total_added}개 / 업데이트 {total_updated}개")
-        if debug_rows:
-            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+            for page in range(1, int(pages) + 1):
+                page_url = set_page_param(base_url, page)
+                log_box.info(f"{page}페이지 가져오는 중: {page_url}")
+                try:
+                    products, debug = parse_products_from_page(page_url)
+                    added, updated = upsert_products(products)
+                    total += len(products)
+                    total_added += added
+                    total_updated += updated
+                    debug["page"] = page
+                    debug["added"] = added
+                    debug["updated"] = updated
+                    debug_rows.append(debug)
+                except Exception as e:
+                    st.error(f"{page}페이지 오류: {e}")
+                progress.progress(page / int(pages))
+                time.sleep(float(delay))
+
+            set_meta("last_sync_at", now_text())
+            st.success(f"동기화 완료: 총 {total}개 처리 / 새 상품 {total_added}개 / 업데이트 {total_updated}개")
+            if debug_rows:
+                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+
+    with price_tab:
+        render_supply_price_import_panel()
 
     if st.button("닫기", key="sync_dialog_close"):
         st.session_state["sync_dialog_open"] = False
@@ -2540,7 +2817,7 @@ def page_rentals():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "cloud-fix-20260618"
+APP_BUILD = "cloud-fix-20260619-supply-import-v4"
 require_app_password()
 
 st.markdown("""
