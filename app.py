@@ -3,6 +3,8 @@ import re
 import time
 import math
 import base64
+import hashlib
+import json
 from html import escape
 from io import BytesIO
 from datetime import date, datetime
@@ -1420,6 +1422,86 @@ def make_quote_pdf_bytes(quote_id):
     return out.getvalue()
 
 
+def make_pdf_from_png_bytes(png_bytes):
+    img = Image.open(BytesIO(png_bytes)).convert("RGB")
+    out = BytesIO()
+    img.save(out, format="PDF", resolution=150.0)
+    out.seek(0)
+    return out.getvalue()
+
+
+def quote_export_signature(quote_id):
+    """견적서 PNG/PDF 캐시 무효화를 위한 가벼운 서명값."""
+    quote = get_quote(quote_id) or {}
+    try:
+        items = load_quote_items_df(quote_id)
+        item_rows = items[[
+            "id", "product_no", "product_name", "size_text", "thumbnail_url",
+            "quantity", "unit_price", "line_total"
+        ]].fillna("").to_dict(orient="records") if not items.empty else []
+    except Exception:
+        item_rows = []
+    payload = {
+        "quote_no": quote.get("quote_no"),
+        "team_name": quote.get("team_name"),
+        "pickup_date": str(quote.get("pickup_date", "")),
+        "return_date": str(quote.get("return_date", "")),
+        "subtotal": quote.get("subtotal"),
+        "vat": quote.get("vat"),
+        "total": quote.get("total"),
+        "updated_at": str(quote.get("updated_at", "")),
+        "items": item_rows,
+    }
+    return hashlib.md5(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_quote_png_bytes(quote_id, signature):
+    return make_quote_image_bytes(quote_id)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_quote_pdf_bytes(quote_id, signature):
+    png_bytes = cached_quote_png_bytes(quote_id, signature)
+    return make_pdf_from_png_bytes(png_bytes)
+
+
+def render_quote_export_buttons(quote_id, key_prefix="quote_export"):
+    """PNG/PDF는 화면 진입 시 바로 만들지 않고 사용자가 눌렀을 때만 생성한다."""
+    signature = quote_export_signature(quote_id)
+    png_key = f"{key_prefix}_{quote_id}_{signature}_png"
+    pdf_key = f"{key_prefix}_{quote_id}_{signature}_pdf"
+
+    st.caption("PNG/PDF는 파일 생성 버튼을 누른 뒤 다운로드됩니다. 큰 견적서는 처음 생성할 때만 시간이 걸릴 수 있습니다.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("PNG 파일 생성", use_container_width=True, key=f"{key_prefix}_make_png_{quote_id}_{signature}"):
+            with st.spinner("PNG 생성 중..."):
+                st.session_state[png_key] = cached_quote_png_bytes(quote_id, signature)
+        if png_key in st.session_state:
+            st.download_button(
+                "PNG 다운로드",
+                data=st.session_state[png_key],
+                file_name=quote_filename(quote_id, "png"),
+                mime="image/png",
+                use_container_width=True,
+                key=f"{key_prefix}_download_png_{quote_id}_{signature}",
+            )
+    with c2:
+        if st.button("PDF 파일 생성", use_container_width=True, key=f"{key_prefix}_make_pdf_{quote_id}_{signature}"):
+            with st.spinner("PDF 생성 중..."):
+                st.session_state[pdf_key] = cached_quote_pdf_bytes(quote_id, signature)
+        if pdf_key in st.session_state:
+            st.download_button(
+                "PDF 다운로드",
+                data=st.session_state[pdf_key],
+                file_name=quote_filename(quote_id, "pdf"),
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"{key_prefix}_download_pdf_{quote_id}_{signature}",
+            )
+
+
 def quote_filename(quote_id, ext="png"):
     quote = get_quote(quote_id)
     team = re.sub(r"[^0-9A-Za-z가-힣_-]", "_", quote.get("team_name", "팀") if quote else "팀")
@@ -2157,13 +2239,7 @@ def page_quote_create():
         st.subheader("방금 만든 견적서 다운로드")
         q = get_quote(last_id)
         if q:
-            png_bytes = make_quote_image_bytes(last_id)
-            pdf_bytes = make_quote_pdf_bytes(last_id)
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button("PNG 다운로드", data=png_bytes, file_name=quote_filename(last_id, "png"), mime="image/png", use_container_width=True)
-            with d2:
-                st.download_button("PDF 다운로드", data=pdf_bytes, file_name=quote_filename(last_id, "pdf"), mime="application/pdf", use_container_width=True)
+            render_quote_export_buttons(last_id, key_prefix="created_quote_export")
 
 
 # -----------------------------
@@ -2222,13 +2298,8 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="qu
                     st.success("삭제 처리했습니다. 일반 목록에서는 보이지 않습니다.")
                     st.rerun()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        png_bytes = make_quote_image_bytes(quote_id)
-        st.download_button("견적서 PNG 다운로드", png_bytes, quote_filename(quote_id, "png"), "image/png", use_container_width=True, key=f"{key_prefix}_png_{quote_id}")
-    with c2:
-        pdf_bytes = make_quote_pdf_bytes(quote_id)
-        st.download_button("견적서 PDF 다운로드", pdf_bytes, quote_filename(quote_id, "pdf"), "application/pdf", use_container_width=True, key=f"{key_prefix}_pdf_{quote_id}")
+    st.markdown("#### 견적서 파일")
+    render_quote_export_buttons(quote_id, key_prefix=f"{key_prefix}_export")
 
     st.subheader("견적 상품")
     if items.empty:
