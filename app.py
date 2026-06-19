@@ -206,6 +206,121 @@ def calculate_line_total(quantity, unit_price, pickup_date, return_date, multipl
     return max(safe_int(quantity, 1), 1) * max(safe_int(unit_price, 0), 0) * factor
 
 
+def parse_item_note(value):
+    """quote_items.availability_note에 저장한 상품별 날짜 JSON을 읽는다."""
+    if value is None:
+        return {}
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def make_item_note(pickup_date, return_date, existing=None):
+    """상품별 픽업/반납 날짜를 availability_note 텍스트에 저장한다."""
+    data = parse_item_note(existing)
+    data["pickup_date"] = normalize_date_text(pickup_date)
+    data["return_date"] = normalize_date_text(return_date)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def get_item_dates(item, quote=None):
+    """견적 상품의 개별 날짜를 반환한다. 없으면 견적서 전체 날짜를 사용한다."""
+    note = parse_item_note(item.get("availability_note", "") if hasattr(item, "get") else "")
+    pickup = note.get("pickup_date") or (quote or {}).get("pickup_date")
+    ret = note.get("return_date") or (quote or {}).get("return_date")
+    return normalize_date_text(pickup), normalize_date_text(ret)
+
+
+def update_quote_date_range_from_items(quote_id):
+    """상품별 날짜의 최소/최대값으로 견적서 대표 날짜를 맞춘다."""
+    quote = get_quote(quote_id)
+    items = load_quote_items_df(quote_id)
+    if not quote or items.empty:
+        return
+    pickups = []
+    returns = []
+    for _, item in items.iterrows():
+        try:
+            p, r = get_item_dates(item, quote)
+            pickups.append(p)
+            returns.append(r)
+        except Exception:
+            pass
+    if not pickups or not returns:
+        return
+    new_pickup = min(pickups)
+    new_return = max(returns)
+    supabase_client().table("quotes").update({
+        "pickup_date": new_pickup,
+        "return_date": new_return,
+        "updated_at": datetime.now().isoformat(),
+    }).eq("quote_id", int(quote_id)).execute()
+
+
+def set_all_quote_item_dates(quote_id, pickup_date, return_date, reprice=True):
+    """전체 날짜 수정 시 모든 견적 상품 날짜를 같은 날짜로 덮어쓴다."""
+    quote = get_quote(quote_id)
+    if not quote:
+        return
+    items = load_quote_items_df(quote_id)
+    client = supabase_client()
+    pickup = normalize_date_text(pickup_date)
+    ret = normalize_date_text(return_date)
+    multiplier = quote_price_multiplier(pickup, ret)
+    for _, item in items.iterrows():
+        qty = max(safe_int(item.get("quantity", 1), 1), 1)
+        unit_price = max(safe_int(item.get("unit_price", 0), 0), 0)
+        payload = {
+            "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
+            "updated_at": datetime.now().isoformat(),
+        }
+        if reprice:
+            payload["line_total"] = calculate_line_total(qty, unit_price, pickup, ret, multiplier=multiplier)
+        client.table("quote_items").update(payload).eq("id", int(item["id"])).execute()
+
+
+def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
+    """견적 상품 하나의 날짜를 수정하고 해당 날짜 기준으로 가격을 다시 계산한다."""
+    try:
+        pickup = normalize_date_text(pickup_date)
+        ret = normalize_date_text(return_date)
+    except Exception as e:
+        return False, [str(e)]
+    if ret < pickup:
+        return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
+
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, [message]
+
+    item_rows = supabase_client().table("quote_items").select("*").eq("id", int(item_id)).limit(1).execute().data or []
+    if not item_rows:
+        return False, ["견적 상품을 찾지 못했습니다."]
+    item = item_rows[0]
+    product = get_product(item.get("product_no")) or {}
+    total_qty = max(safe_int(product.get("qty", 1), 1), 1)
+    qty = max(safe_int(item.get("quantity", 1), 1), 1)
+    if qty > total_qty:
+        return False, [f"보유수량이 {total_qty}개입니다."]
+
+    line_total = calculate_line_total(qty, safe_int(item.get("unit_price", 0), 0), pickup, ret)
+    supabase_client().table("quote_items").update({
+        "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
+        "line_total": line_total,
+        "updated_at": datetime.now().isoformat(),
+    }).eq("id", int(item_id)).execute()
+    update_quote_date_range_from_items(quote_id)
+    update_quote_totals(quote_id, reprice=True)
+    clear_data_cache()
+    msgs = [message] if message else []
+    return True, msgs
+
+
 def pricing_summary_text(pickup_date, return_date):
     try:
         ctx = rental_pricing_context(pickup_date, return_date)
@@ -896,6 +1011,7 @@ def update_quote_header(quote_id, team_name, pickup_date, return_date):
         "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
+    set_all_quote_item_dates(quote_id, pickup, ret, reprice=True)
     update_quote_totals(quote_id, reprice=True)
     clear_data_cache()
     return True, ([message] if message else [])
@@ -924,13 +1040,16 @@ def update_quote_totals(quote_id, reprice=True, clear_cache=True):
     if not quote:
         return
     client = supabase_client()
-    rows = client.table("quote_items").select("id,quantity,unit_price,line_total").eq("quote_id", int(quote_id)).execute().data or []
+    rows = client.table("quote_items").select("id,quantity,unit_price,line_total,availability_note").eq("quote_id", int(quote_id)).execute().data or []
     subtotal = 0
-    multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
     for row in rows:
         quantity = max(safe_int(row.get("quantity", 1), 1), 1)
         unit_price = max(safe_int(row.get("unit_price", 0), 0), 0)
-        line_total = calculate_line_total(quantity, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier)
+        try:
+            item_pickup, item_return = get_item_dates(row, quote)
+        except Exception:
+            item_pickup, item_return = quote["pickup_date"], quote["return_date"]
+        line_total = calculate_line_total(quantity, unit_price, item_pickup, item_return)
         subtotal += line_total
         if reprice and line_total != safe_int(row.get("line_total", 0), 0):
             client.table("quote_items").update({
@@ -997,6 +1116,7 @@ def create_quote(team_name, pickup_date, return_date, selected_items, memo=""):
             "quantity": qty,
             "unit_price": unit_price,
             "line_total": line_total,
+            "availability_note": make_item_note(pickup, ret),
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         })
@@ -1132,7 +1252,7 @@ def load_quote_items_df(quote_id):
     rows = supabase_client().table("quote_items").select("*").eq("quote_id", int(quote_id)).order("id").execute().data or []
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["id", "quote_id", "product_no", "product_name", "size_text", "thumbnail_path", "thumbnail_url", "quantity", "unit_price", "line_total"])
+        return pd.DataFrame(columns=["id", "quote_id", "product_no", "product_name", "size_text", "thumbnail_path", "thumbnail_url", "quantity", "unit_price", "line_total", "availability_note"])
 
     df = fill_quote_item_image_fallbacks(df)
 
@@ -1144,7 +1264,7 @@ def load_quote_items_df(quote_id):
     if "thumbnail_url" not in df.columns:
         df["thumbnail_url"] = ""
 
-    cols = ["id", "quote_id", "product_no", "product_name", "size_text", "thumbnail_path", "thumbnail_url", "quantity", "unit_price", "line_total"]
+    cols = ["id", "quote_id", "product_no", "product_name", "size_text", "thumbnail_path", "thumbnail_url", "quantity", "unit_price", "line_total", "availability_note"]
     for c in cols:
         if c not in df.columns:
             df[c] = None
@@ -1176,6 +1296,7 @@ def add_item_to_quote(quote_id, product_no, quantity=1):
             "quantity": new_qty,
             "unit_price": unit_price,
             "line_total": calculate_line_total(new_qty, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
+            "availability_note": make_item_note(quote["pickup_date"], quote["return_date"]),
             "updated_at": datetime.now().isoformat(),
         }).eq("id", item_id).execute()
     else:
@@ -1190,6 +1311,7 @@ def add_item_to_quote(quote_id, product_no, quantity=1):
             "quantity": qty,
             "unit_price": unit_price,
             "line_total": calculate_line_total(qty, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
+            "availability_note": make_item_note(quote["pickup_date"], quote["return_date"]),
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }).execute()
@@ -1211,7 +1333,7 @@ def delete_quote_item(item_id, quote_id):
 
 def update_quote_item(item_id, quantity, unit_price):
     client = supabase_client()
-    item_rows = client.table("quote_items").select("quote_id,product_no").eq("id", int(item_id)).limit(1).execute().data or []
+    item_rows = client.table("quote_items").select("quote_id,product_no,availability_note").eq("id", int(item_id)).limit(1).execute().data or []
     if not item_rows:
         return False, "견적 상품을 찾지 못했습니다."
     quote_id = int(item_rows[0]["quote_id"])
@@ -1228,14 +1350,14 @@ def update_quote_item(item_id, quantity, unit_price):
         return False, f"보유수량이 {max_qty}개입니다."
     price = max(safe_int(unit_price, 0), 0)
     quote = get_quote(quote_id)
-    multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
+    item_pickup, item_return = get_item_dates(item_rows[0], quote)
     client.table("quote_items").update({
         "quantity": qty,
         "unit_price": price,
-        "line_total": calculate_line_total(qty, price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
+        "line_total": calculate_line_total(qty, price, item_pickup, item_return),
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
-    update_quote_totals(quote_id, reprice=False)
+    update_quote_totals(quote_id, reprice=True)
     clear_data_cache()
     return True, message or "상품 정보를 변경했습니다."
 
@@ -1252,17 +1374,18 @@ def check_quote_availability(quote_id, pickup_date=None, return_date=None, exclu
         return []
 
     product_nos = tuple(items["product_no"].astype(str).tolist())
-    status_map = bulk_product_status(product_nos, pickup, ret, int(quote_id) if exclude_self else 0)
     product_map = load_products_map(product_nos)
     failures = []
     for _, item in items.iterrows():
         product_no = str(item["product_no"])
+        item_pickup, item_return = (pickup, ret) if (pickup_date or return_date) else get_item_dates(item, quote)
+        status_one = bulk_product_status((product_no,), item_pickup, item_return, int(quote_id) if exclude_self else 0).get(product_no, {})
         total_qty = max(safe_int((product_map.get(product_no) or {}).get("qty", 1), 1), 1)
-        reserved = safe_int((status_map.get(product_no) or {}).get("reserved", 0), 0)
+        reserved = safe_int(status_one.get("reserved", 0), 0)
         available_qty = max(total_qty - reserved, 0)
         needed = safe_int(item["quantity"], 1)
         if needed > available_qty:
-            failures.append(f'{item["product_name"]} / 필요 {needed}개 / 가능 {available_qty}개')
+            failures.append(f'{item["product_name"]} / {item_pickup}~{item_return} / 필요 {needed}개 / 가능 {available_qty}개')
     return failures
 
 
@@ -1292,8 +1415,8 @@ def confirm_quote(quote_id):
             "team_name": quote["team_name"],
             "product_no": str(item["product_no"]),
             "product_name": item["product_name"],
-            "pickup_date": quote["pickup_date"],
-            "return_date": quote["return_date"],
+            "pickup_date": get_item_dates(item, quote)[0],
+            "return_date": get_item_dates(item, quote)[1],
             "quantity": safe_int(item["quantity"], 1),
             "status": "대여중",
             "memo": "",
@@ -1434,6 +1557,15 @@ def update_rental_item_dates(rental_id, new_pickup, new_return):
         "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(rental_id)).execute()
+    # 같은 견적/상품의 견적 상품 날짜와 금액도 같이 갱신한다.
+    qi_rows = supabase_client().table("quote_items").select("id,quantity,unit_price,availability_note").eq("quote_id", int(rental["quote_id"])).eq("product_no", str(rental["product_no"])).execute().data or []
+    for qi in qi_rows:
+        line_total = calculate_line_total(qi.get("quantity", 1), qi.get("unit_price", 0), pickup, ret)
+        supabase_client().table("quote_items").update({
+            "availability_note": make_item_note(pickup, ret, qi.get("availability_note", "")),
+            "line_total": line_total,
+            "updated_at": datetime.now().isoformat(),
+        }).eq("id", int(qi["id"])).execute()
     update_quote_date_range_from_rentals(int(rental["quote_id"]))
     refresh_quote_return_status(int(rental["quote_id"]))
     clear_data_cache()
@@ -1462,6 +1594,7 @@ def update_quote_dates(quote_id, new_pickup, new_return):
         "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
+    set_all_quote_item_dates(quote_id, pickup, ret, reprice=True)
 
     for status in ACTIVE_RENTAL_STATUSES:
         client.table("rentals").update({
@@ -2699,11 +2832,41 @@ if hasattr(st, "dialog"):
                 st.error("날짜를 수정할 수 없습니다.")
                 for f in failures:
                     st.write(f"- {f}")
+
+    @st.dialog("견적 상품 날짜 수정")
+    def quote_item_date_dialog(item_id, quote_id):
+        quote = get_quote(quote_id)
+        items = load_quote_items_df(quote_id)
+        target = items[items["id"].astype(str) == str(item_id)] if not items.empty else pd.DataFrame()
+        if not quote or target.empty:
+            st.error("견적 상품을 찾지 못했습니다.")
+            return
+        item = target.iloc[0]
+        pickup, ret = get_item_dates(item, quote)
+        st.caption(f"{quote['quote_no']} / {item['product_name']}")
+        c1, c2 = st.columns(2)
+        with c1:
+            new_pickup = st.text_input("새 픽업 날짜", value=str(pickup), help=date_input_help(), key=f"quote_item_pickup_{item_id}")
+        with c2:
+            new_return = st.text_input("새 반납 날짜", value=str(ret), help=date_input_help(), key=f"quote_item_return_{item_id}")
+        if st.button("날짜 수정 저장", type="primary", use_container_width=True, key=f"quote_item_date_save_{item_id}"):
+            ok, messages = update_quote_item_dates(int(item_id), int(quote_id), new_pickup, new_return)
+            if ok:
+                for msg in messages:
+                    if msg:
+                        st.info(msg)
+                st.success("견적 상품 날짜와 금액을 수정했습니다.")
+                st.rerun()
+            else:
+                st.error("날짜를 수정할 수 없습니다.")
+                for msg in messages:
+                    st.write(f"- {msg}")
 else:
     availability_detail_dialog = None
     quote_add_product_dialog = None
     rental_date_dialog = None
     rental_item_date_dialog = None
+    quote_item_date_dialog = None
     quote_header_dialog = None
 
 
@@ -2801,6 +2964,10 @@ def page_quote_create():
 
     search = st.text_input("상품 검색", key="create_product_search", placeholder="상품명 입력")
     st.subheader("상품 선택")
+    try:
+        st.caption(f"총 저장 상품 {count_products_fast(''):,}개")
+    except Exception:
+        pass
 
     page_size = 20
     if "create_product_page" not in st.session_state:
@@ -2989,22 +3156,24 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
         st.info("상품이 없습니다.")
     else:
         product_nos = tuple(items["product_no"].astype(str).tolist())
-        status_map = bulk_product_status(product_nos, str(quote["pickup_date"]), str(quote["return_date"]), int(quote_id))
         product_map = load_products_map(product_nos)
         for _, item in items.iterrows():
             product = product_map.get(str(item["product_no"])) or {}
             stock_qty = max(safe_int(product.get("qty", 1), 1), 1)
+            item_pickup, item_return = get_item_dates(item, quote)
+            status_one = bulk_product_status((str(item["product_no"]),), item_pickup, item_return, int(quote_id)).get(str(item["product_no"]), {"reserved": 0, "pending": 0})
+            item_multiplier = quote_price_multiplier(item_pickup, item_return)
             with st.container(border=True):
                 render_status_button_bar(
                     item["product_no"],
-                    quote["pickup_date"],
-                    quote["return_date"],
+                    item_pickup,
+                    item_return,
                     key_prefix=f"{key_prefix}_item_status_{item['id']}",
                     exclude_quote_id=quote_id,
-                    precomputed=status_map.get(str(item["product_no"]), {"reserved": 0, "pending": 0}),
+                    precomputed=status_one,
                     total_qty_override=stock_qty,
                 )
-                c1, c2, c3, c4, c5 = st.columns([1.1, 2.7, 1.4, 1.4, 1.0])
+                c1, c2, c3, c4, c5, c6 = st.columns([1.1, 2.4, 1.2, 1.3, 1.0, 1.0])
                 with c1:
                     show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
                 with c2:
@@ -3012,13 +3181,14 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                     st.caption(item.get("size_text", ""))
                     st.caption(f"상품번호: {item['product_no']}")
                     st.caption(f"보유수량: {stock_qty}개")
+                    st.caption(f"상품 날짜: {item_pickup} ~ {item_return}")
                 if composition_editable:
                     with c3:
                         qty = render_quantity_stepper("수량", item["quantity"], stock_qty, f"{key_prefix}_qty_{item['id']}")
                     with c4:
                         unit = st.number_input("단가", min_value=0, value=safe_int(item["unit_price"], 0), step=1000, key=f"{key_prefix}_price_{item['id']}")
-                        st.caption(f"적용 {quote_price_multiplier(quote['pickup_date'], quote['return_date'])}배")
-                        st.caption(f"금액: {money(calculate_line_total(qty, unit, quote['pickup_date'], quote['return_date']))}")
+                        st.caption(f"적용 {item_multiplier}배")
+                        st.caption(f"금액: {money(calculate_line_total(qty, unit, item_pickup, item_return, multiplier=item_multiplier))}")
                     with c5:
                         if st.button("변경 저장", key=f"{key_prefix}_save_item_{item['id']}", use_container_width=True):
                             ok, msg = update_quote_item(item["id"], qty, unit)
@@ -3028,6 +3198,10 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                                 st.rerun()
                             else:
                                 st.error(msg)
+                        if st.button("날짜 수정", key=f"{key_prefix}_date_item_{item['id']}", use_container_width=True):
+                            if quote_item_date_dialog is not None:
+                                quote_item_date_dialog(int(item["id"]), int(quote_id))
+                    with c6:
                         if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True):
                             ok, msg = delete_quote_item(item["id"], quote_id)
                             if ok:
@@ -3041,7 +3215,11 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                         st.write(f"수량: {item['quantity']}")
                     with c4:
                         st.write(f"단가: {money(item['unit_price'])}")
+                        st.write(f"적용 {item_multiplier}배")
                         st.write(f"금액: {money(item['line_total'])}")
+                    with c5:
+                        if st.button("날짜 수정", key=f"{key_prefix}_date_item_readonly_{item['id']}", disabled=True, use_container_width=True):
+                            pass
 
     if status in ["확정", "부분반납", "반납완료"]:
         st.divider()
@@ -3058,6 +3236,18 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                 if rental.get("status") == "삭제":
                     continue
                 with st.container(border=True):
+                    rental_product = get_product(rental["product_no"]) or {}
+                    rental_stock_qty = max(safe_int(rental_product.get("qty", 1), 1), 1)
+                    rental_status_one = bulk_product_status((str(rental["product_no"]),), str(rental["pickup_date"]), str(rental["return_date"]), int(quote_id)).get(str(rental["product_no"]), {"reserved": 0, "pending": 0})
+                    render_status_button_bar(
+                        rental["product_no"],
+                        rental["pickup_date"],
+                        rental["return_date"],
+                        key_prefix=f"{key_prefix}_rental_status_{rental['id']}",
+                        exclude_quote_id=quote_id,
+                        precomputed=rental_status_one,
+                        total_qty_override=rental_stock_qty,
+                    )
                     c0, c1, c2, c3, c4 = st.columns([1.0, 2.8, 1.8, 1.2, 1.2])
                     with c0:
                         _tp, _tu = item_thumb.get(str(rental["product_no"]), ("", ""))
@@ -3211,7 +3401,7 @@ def page_quote_history():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "cloud-fix-20260619-unified-holiday-pricing-v1"
+APP_BUILD = "cloud-fix-20260619-item-date-pricing-v2"
 require_app_password()
 
 st.markdown("""
@@ -3322,7 +3512,7 @@ st.sidebar.markdown("""
 <div class='sidebar-subtitle'>렌탈 재고·견적 관리</div>
 """, unsafe_allow_html=True)
 
-menu_options = ["견적서 만들기", "제품 조회", "견적서 조회/반납 기록"]
+menu_options = ["견적서 만들기", "견적서 조회/반납 기록"]
 if st.session_state.get("menu") not in menu_options:
     st.session_state["menu"] = "견적서 만들기"
 
@@ -3372,8 +3562,6 @@ st.sidebar.caption(f"최근 동기화: {last_sync}")
 
 if menu == "견적서 만들기":
     page_quote_create()
-elif menu == "제품 조회":
-    page_products()
 elif menu == "견적서 조회/반납 기록":
     page_quote_history()
 
