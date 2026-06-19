@@ -5,9 +5,10 @@ import math
 import base64
 import hashlib
 import json
+import calendar
 from html import escape
 from io import BytesIO
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
@@ -65,8 +66,152 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+
 def today_yyyymmdd():
     return datetime.now().strftime("%Y%m%d")
+
+
+def normalize_date_text(value, allow_blank=False):
+    """다양한 날짜 입력을 DB 표준 YYYY-MM-DD로 정규화한다.
+
+    지원 예: 20260618, 2026/06/18, 2026.06.18, 2026.06.18., 2026-06-18
+    """
+    if value is None:
+        if allow_blank:
+            return ""
+        raise ValueError("날짜를 입력해야 합니다.")
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value).strip()
+    if not text:
+        if allow_blank:
+            return ""
+        raise ValueError("날짜를 입력해야 합니다.")
+
+    # ISO datetime이 들어온 경우 날짜 부분만 사용한다.
+    text = text.split("T", 1)[0].strip().rstrip(".")
+    groups = re.findall(r"\d+", text)
+    if len(groups) == 1:
+        digits = groups[0]
+        if len(digits) != 8:
+            raise ValueError("날짜는 20260618 또는 2026/06/18 형식으로 입력하세요.")
+        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+    elif len(groups) >= 3:
+        year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+    else:
+        raise ValueError("날짜 형식을 확인하세요.")
+
+    return date(year, month, day).isoformat()
+
+
+def try_normalize_date_text(value, allow_blank=True):
+    try:
+        return normalize_date_text(value, allow_blank=allow_blank)
+    except Exception:
+        return "" if allow_blank else None
+
+
+def date_input_help():
+    return "예: 20260618 / 2026.06.18 / 2026/06/18"
+
+
+def combine_team_person(team_name, person_name):
+    team = clean_text(team_name)
+    person = clean_text(person_name)
+    if team and person:
+        return f"{team}-{person}"
+    return team or person
+
+
+def split_team_person(value):
+    text = clean_text(value)
+    if "-" not in text:
+        return text, ""
+    team, person = text.rsplit("-", 1)
+    return team.strip(), person.strip()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_holiday_dates():
+    raw = get_meta("holiday_dates", "[]")
+    try:
+        values = json.loads(raw) if raw else []
+    except Exception:
+        values = []
+    out = set()
+    for value in values:
+        normalized = try_normalize_date_text(value)
+        if normalized:
+            out.add(normalized)
+    return out
+
+
+def save_holiday_dates(values):
+    normalized = sorted({normalize_date_text(v) for v in values if str(v).strip()})
+    set_meta("holiday_dates", json.dumps(normalized, ensure_ascii=False))
+    clear_data_cache()
+
+
+def rental_pricing_context(pickup_date, return_date, holidays=None):
+    """엑셀의 연박 계산 기준을 앱용으로 정리한다.
+
+    - 일요일과 사용자 지정 휴일은 영업일에서 제외
+    - 2박 3일까지 기본 2배(당일/1박은 1배)
+    - NETWORKDAYS.INTL(..., "0000001", 휴일)-3 만큼 연박 추가
+    """
+    pickup_s = normalize_date_text(pickup_date)
+    return_s = normalize_date_text(return_date)
+    start = datetime.strptime(pickup_s, "%Y-%m-%d").date()
+    end = datetime.strptime(return_s, "%Y-%m-%d").date()
+    if end < start:
+        raise ValueError("반납 날짜가 픽업 날짜보다 빠릅니다.")
+
+    holidays = set(holidays if holidays is not None else get_holiday_dates())
+    cursor = start
+    billable_dates = []
+    while cursor <= end:
+        # Python weekday: Monday=0, Sunday=6
+        if cursor.weekday() != 6 and cursor.isoformat() not in holidays:
+            billable_dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+
+    stay_nights = max((end - start).days, 0)
+    base_multiplier = 1 if stay_nights <= 1 else 2
+    extra_days = max(0, len(billable_dates) - 3)
+    multiplier = max(1, base_multiplier + extra_days)
+    return {
+        "pickup_date": pickup_s,
+        "return_date": return_s,
+        "stay_nights": stay_nights,
+        "billable_days": len(billable_dates),
+        "billable_dates": billable_dates,
+        "base_multiplier": base_multiplier,
+        "extra_days": extra_days,
+        "multiplier": multiplier,
+    }
+
+
+def quote_price_multiplier(pickup_date, return_date):
+    try:
+        return rental_pricing_context(pickup_date, return_date)["multiplier"]
+    except Exception:
+        return 1
+
+
+def calculate_line_total(quantity, unit_price, pickup_date, return_date, multiplier=None):
+    factor = max(safe_int(multiplier, 0), 1) if multiplier is not None else quote_price_multiplier(pickup_date, return_date)
+    return max(safe_int(quantity, 1), 1) * max(safe_int(unit_price, 0), 0) * factor
+
+
+def pricing_summary_text(pickup_date, return_date):
+    try:
+        ctx = rental_pricing_context(pickup_date, return_date)
+        return f"청구 영업일 {ctx['billable_days']}일 · 기본 {ctx['base_multiplier']}배 · 연박 +{ctx['extra_days']}일 · 적용 {ctx['multiplier']}배"
+    except Exception:
+        return "날짜를 입력하면 연박 가격이 계산됩니다."
 
 
 # -----------------------------
@@ -363,8 +508,9 @@ def parse_products_from_page(page_url):
 
 def upsert_products(products):
     client = supabase_client()
-    existing_rows = table_all("products", select="product_no,price")
+    existing_rows = table_all("products", select="product_no,price,updated_at")
     existing_price = {str(r.get("product_no")): safe_int(r.get("price", 0), 0) for r in existing_rows}
+    existing_updated_at = {str(r.get("product_no")): str(r.get("updated_at") or "") for r in existing_rows}
     existing_set = set(existing_price.keys())
 
     rows = []
@@ -393,7 +539,7 @@ def upsert_products(products):
             "thumbnail_url": p.get("thumbnail_url", ""),
             "local_thumbnail_path": p.get("local_thumbnail_path", ""),
             "source_page": p.get("source_page", ""),
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": existing_updated_at.get(product_no) or datetime.now().isoformat(),
         })
 
     for batch in chunked(rows, 300):
@@ -546,6 +692,17 @@ def get_product(product_no):
     return dict(data[0]) if data else None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_products_map(product_nos_tuple):
+    product_nos = [str(x) for x in product_nos_tuple if str(x)]
+    out = {}
+    for batch in chunked(product_nos, 250):
+        rows = supabase_client().table("products").select("product_no,name,size_text,qty,price,thumbnail_url,local_thumbnail_path").in_("product_no", batch).execute().data or []
+        for row in rows:
+            out[str(row.get("product_no"))] = row
+    return out
+
+
 def filter_products(df, search):
     if df.empty or not search:
         return df
@@ -664,9 +821,9 @@ def load_product_history_df(product_no, limit=20):
 
 
 def parse_date_text(value):
-    """YYYY-MM-DD 또는 YYYY/MM/DD를 date 객체로 변환한다."""
-    text = str(value or "").strip().replace("/", "-")
-    return datetime.strptime(text, "%Y-%m-%d").date()
+    """호환용: 다양한 텍스트 날짜를 date 객체로 변환한다."""
+    return datetime.strptime(normalize_date_text(value), "%Y-%m-%d").date()
+
 
 
 # -----------------------------
@@ -690,37 +847,59 @@ def status_filter_control(label, options, key):
     return st.session_state.get(key)
 
 
+def reopen_quote_for_edit(quote_id):
+    """확정 견적을 수정할 때 기존 활성 대여를 해제하고 견적중으로 되돌린다."""
+    quote = get_quote(quote_id)
+    if not quote:
+        return False, "견적서를 찾지 못했습니다."
+    status = str(quote.get("status", ""))
+    if status == "견적중":
+        return True, ""
+    if status == "확정":
+        client = supabase_client()
+        client.table("rentals").update({
+            "status": "삭제",
+            "updated_at": datetime.now().isoformat(),
+        }).eq("quote_id", int(quote_id)).in_("status", list(ACTIVE_RENTAL_STATUSES)).execute()
+        client.table("quotes").update({
+            "status": "견적중",
+            "updated_at": datetime.now().isoformat(),
+        }).eq("quote_id", int(quote_id)).execute()
+        clear_data_cache()
+        return True, "확정 상태를 해제하고 견적중으로 전환했습니다."
+    if status in ["부분반납", "반납완료"]:
+        return False, "반납이 시작된 견적서는 상품 구성이나 견적 정보를 수정할 수 없습니다."
+    return False, "현재 상태에서는 견적서를 수정할 수 없습니다."
+
+
 def update_quote_header(quote_id, team_name, pickup_date, return_date):
     quote = get_quote(quote_id)
     if not quote:
         return False, ["견적서를 찾지 못했습니다."]
 
-    if str(return_date) < str(pickup_date):
+    try:
+        pickup = normalize_date_text(pickup_date)
+        ret = normalize_date_text(return_date)
+    except Exception as e:
+        return False, [str(e)]
+    if ret < pickup:
         return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
 
-    if quote.get("status") in ["확정", "부분반납"]:
-        failures = check_quote_availability(quote_id, pickup_date=str(pickup_date), return_date=str(return_date), exclude_self=True)
-        if failures:
-            return False, failures
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, [message]
 
     client = supabase_client()
     client.table("quotes").update({
         "team_name": str(team_name),
-        "pickup_date": str(pickup_date),
-        "return_date": str(return_date),
+        "pickup_date": pickup,
+        "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
+    update_quote_totals(quote_id, reprice=True)
+    clear_data_cache()
+    return True, ([message] if message else [])
 
-    # 활성 대여만 견적서 날짜와 같이 조정
-    for status in ACTIVE_RENTAL_STATUSES:
-        client.table("rentals").update({
-            "team_name": str(team_name),
-            "pickup_date": str(pickup_date),
-            "return_date": str(return_date),
-            "updated_at": datetime.now().isoformat(),
-        }).eq("quote_id", int(quote_id)).eq("status", status).execute()
-
-    return True, []
 
 
 # -----------------------------
@@ -740,28 +919,55 @@ def generate_quote_no():
     return f"{prefix}-{(max(nums) + 1 if nums else 1):03d}"
 
 
-def update_quote_totals(quote_id):
-    items = load_quote_items_df(quote_id)
-    subtotal = int(items["line_total"].fillna(0).astype(int).sum()) if not items.empty else 0
+def update_quote_totals(quote_id, reprice=True, clear_cache=True):
+    quote = get_quote(quote_id)
+    if not quote:
+        return
+    client = supabase_client()
+    rows = client.table("quote_items").select("id,quantity,unit_price,line_total").eq("quote_id", int(quote_id)).execute().data or []
+    subtotal = 0
+    multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
+    for row in rows:
+        quantity = max(safe_int(row.get("quantity", 1), 1), 1)
+        unit_price = max(safe_int(row.get("unit_price", 0), 0), 0)
+        line_total = calculate_line_total(quantity, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier)
+        subtotal += line_total
+        if reprice and line_total != safe_int(row.get("line_total", 0), 0):
+            client.table("quote_items").update({
+                "line_total": line_total,
+                "updated_at": datetime.now().isoformat(),
+            }).eq("id", int(row["id"])).execute()
+
     vat = int(round(subtotal * 0.1))
     total = subtotal + vat
-    supabase_client().table("quotes").update({
+    client.table("quotes").update({
         "subtotal": subtotal,
         "vat": vat,
         "total": total,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
+    if clear_cache:
+        clear_data_cache()
+
+
+def recalculate_open_quotes_for_holidays():
+    rows = supabase_client().table("quotes").select("quote_id").in_("status", ["견적중", "확정", "부분반납"]).execute().data or []
+    for row in rows:
+        update_quote_totals(int(row["quote_id"]), reprice=True, clear_cache=False)
     clear_data_cache()
+    return len(rows)
 
 
 def create_quote(team_name, pickup_date, return_date, selected_items, memo=""):
+    pickup = normalize_date_text(pickup_date)
+    ret = normalize_date_text(return_date)
     quote_no = generate_quote_no()
     client = supabase_client()
     res = client.table("quotes").insert({
         "quote_no": quote_no,
         "team_name": team_name,
-        "pickup_date": str(pickup_date),
-        "return_date": str(return_date),
+        "pickup_date": pickup,
+        "return_date": ret,
         "status": "견적중",
         "subtotal": 0,
         "vat": 0,
@@ -773,13 +979,14 @@ def create_quote(team_name, pickup_date, return_date, selected_items, memo=""):
     quote_id = int(res.data[0]["quote_id"])
 
     rows = []
+    multiplier = quote_price_multiplier(pickup, ret)
     for product_no, item in selected_items.items():
         p = get_product(product_no)
         if not p:
             continue
         qty = safe_int(item.get("quantity", 1), 1)
         unit_price = safe_int(item.get("unit_price", p.get("price", 0)), 0)
-        line_total = qty * unit_price
+        line_total = calculate_line_total(qty, unit_price, pickup, ret, multiplier=multiplier)
         rows.append({
             "quote_id": quote_id,
             "product_no": str(product_no),
@@ -797,7 +1004,7 @@ def create_quote(team_name, pickup_date, return_date, selected_items, memo=""):
     if rows:
         client.table("quote_items").insert(rows).execute()
 
-    update_quote_totals(quote_id)
+    update_quote_totals(quote_id, reprice=False)
     clear_data_cache()
     return quote_id
 
@@ -949,21 +1156,30 @@ def add_item_to_quote(quote_id, product_no, quantity=1):
     if not p:
         return False, "상품을 찾지 못했습니다."
 
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, message
+
+    quote = get_quote(quote_id)
+    multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
     client = supabase_client()
     existing = client.table("quote_items").select("id,quantity").eq("quote_id", int(quote_id)).eq("product_no", str(product_no)).limit(1).execute().data or []
     unit_price = safe_int(p.get("price", 0), 0)
+    stock_qty = max(safe_int(p.get("qty", 1), 1), 1)
 
     if existing:
         item_id = int(existing[0]["id"])
         new_qty = safe_int(existing[0].get("quantity", 1), 1) + safe_int(quantity, 1)
+        if new_qty > stock_qty:
+            return False, f"보유수량이 {stock_qty}개입니다."
         client.table("quote_items").update({
             "quantity": new_qty,
             "unit_price": unit_price,
-            "line_total": new_qty * unit_price,
+            "line_total": calculate_line_total(new_qty, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
             "updated_at": datetime.now().isoformat(),
         }).eq("id", item_id).execute()
     else:
-        qty = safe_int(quantity, 1)
+        qty = min(max(safe_int(quantity, 1), 1), stock_qty)
         client.table("quote_items").insert({
             "quote_id": int(quote_id),
             "product_no": str(product_no),
@@ -973,35 +1189,55 @@ def add_item_to_quote(quote_id, product_no, quantity=1):
             "local_thumbnail_path": p.get("local_thumbnail_path", ""),
             "quantity": qty,
             "unit_price": unit_price,
-            "line_total": qty * unit_price,
+            "line_total": calculate_line_total(qty, unit_price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }).execute()
 
-    update_quote_totals(quote_id)
+    update_quote_totals(quote_id, reprice=False)
     clear_data_cache()
-    return True, "상품을 추가했습니다."
+    return True, message or "상품을 추가했습니다."
 
 
 def delete_quote_item(item_id, quote_id):
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, message
     supabase_client().table("quote_items").delete().eq("id", int(item_id)).eq("quote_id", int(quote_id)).execute()
-    update_quote_totals(quote_id)
+    update_quote_totals(quote_id, reprice=False)
     clear_data_cache()
+    return True, message or "상품을 삭제했습니다."
 
 
 def update_quote_item(item_id, quantity, unit_price):
-    qty = max(safe_int(quantity, 1), 1)
-    price = max(safe_int(unit_price, 0), 0)
     client = supabase_client()
-    item = client.table("quote_items").select("quote_id").eq("id", int(item_id)).limit(1).execute().data or []
+    item_rows = client.table("quote_items").select("quote_id,product_no").eq("id", int(item_id)).limit(1).execute().data or []
+    if not item_rows:
+        return False, "견적 상품을 찾지 못했습니다."
+    quote_id = int(item_rows[0]["quote_id"])
+    product_no = str(item_rows[0].get("product_no", ""))
+
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, message
+
+    product = get_product(product_no) or {}
+    max_qty = max(safe_int(product.get("qty", 1), 1), 1)
+    qty = max(safe_int(quantity, 1), 1)
+    if qty > max_qty:
+        return False, f"보유수량이 {max_qty}개입니다."
+    price = max(safe_int(unit_price, 0), 0)
+    quote = get_quote(quote_id)
+    multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
     client.table("quote_items").update({
         "quantity": qty,
         "unit_price": price,
-        "line_total": qty * price,
+        "line_total": calculate_line_total(qty, price, quote["pickup_date"], quote["return_date"], multiplier=multiplier),
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
-    if item:
-        update_quote_totals(int(item[0]["quote_id"]))
+    update_quote_totals(quote_id, reprice=False)
+    clear_data_cache()
+    return True, message or "상품 정보를 변경했습니다."
 
 
 def check_quote_availability(quote_id, pickup_date=None, return_date=None, exclude_self=True):
@@ -1009,18 +1245,24 @@ def check_quote_availability(quote_id, pickup_date=None, return_date=None, exclu
     if not quote:
         return ["견적서를 찾지 못했습니다."]
 
-    pickup = pickup_date or quote["pickup_date"]
-    ret = return_date or quote["return_date"]
+    pickup = normalize_date_text(pickup_date or quote["pickup_date"])
+    ret = normalize_date_text(return_date or quote["return_date"])
     items = load_quote_items_df(quote_id)
-    failures = []
+    if items.empty:
+        return []
 
+    product_nos = tuple(items["product_no"].astype(str).tolist())
+    status_map = bulk_product_status(product_nos, pickup, ret, int(quote_id) if exclude_self else 0)
+    product_map = load_products_map(product_nos)
+    failures = []
     for _, item in items.iterrows():
-        exclude_id = quote_id if exclude_self else None
-        available_qty, total_qty, reserved = get_available_qty(item["product_no"], pickup, ret, exclude_quote_id=exclude_id)
+        product_no = str(item["product_no"])
+        total_qty = max(safe_int((product_map.get(product_no) or {}).get("qty", 1), 1), 1)
+        reserved = safe_int((status_map.get(product_no) or {}).get("reserved", 0), 0)
+        available_qty = max(total_qty - reserved, 0)
         needed = safe_int(item["quantity"], 1)
         if needed > available_qty:
             failures.append(f'{item["product_name"]} / 필요 {needed}개 / 가능 {available_qty}개')
-
     return failures
 
 
@@ -1150,6 +1392,7 @@ def update_quote_date_range_from_rentals(quote_id):
         "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
+    update_quote_totals(quote_id, reprice=True)
 
 
 def get_rental_item(rental_id):
@@ -1164,7 +1407,12 @@ def update_rental_item_dates(rental_id, new_pickup, new_return):
         return False, ["대여 상품을 찾지 못했습니다."]
     if rental.get("status") == "반납완료":
         return False, ["이미 반납완료된 상품은 날짜를 수정하지 않습니다."]
-    if str(new_return) < str(new_pickup):
+    try:
+        pickup = normalize_date_text(new_pickup)
+        ret = normalize_date_text(new_return)
+    except Exception as e:
+        return False, [str(e)]
+    if ret < pickup:
         return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
 
     product = get_product(rental["product_no"]) or {}
@@ -1172,8 +1420,8 @@ def update_rental_item_dates(rental_id, new_pickup, new_return):
     qty = max(safe_int(rental.get("quantity", 1), 1), 1)
     conflicts = rentals_query(
         product_no=rental["product_no"],
-        pickup_date=new_pickup,
-        return_date=new_return,
+        pickup_date=pickup,
+        return_date=ret,
         active_only=True,
         exclude_rental_id=int(rental_id),
     )
@@ -1182,12 +1430,13 @@ def update_rental_item_dates(rental_id, new_pickup, new_return):
         return False, [f"{rental['product_name']}은 해당 날짜에 다른 대여와 겹칩니다."]
 
     supabase_client().table("rentals").update({
-        "pickup_date": str(new_pickup),
-        "return_date": str(new_return),
+        "pickup_date": pickup,
+        "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(rental_id)).execute()
     update_quote_date_range_from_rentals(int(rental["quote_id"]))
     refresh_quote_return_status(int(rental["quote_id"]))
+    clear_data_cache()
     return True, []
 
 
@@ -1195,26 +1444,37 @@ def update_quote_dates(quote_id, new_pickup, new_return):
     quote = get_quote(quote_id)
     if not quote:
         return False, ["견적서를 찾지 못했습니다."]
+    try:
+        pickup = normalize_date_text(new_pickup)
+        ret = normalize_date_text(new_return)
+    except Exception as e:
+        return False, [str(e)]
+    if ret < pickup:
+        return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
 
-    failures = check_quote_availability(quote_id, pickup_date=str(new_pickup), return_date=str(new_return), exclude_self=True)
+    failures = check_quote_availability(quote_id, pickup_date=pickup, return_date=ret, exclude_self=True)
     if failures:
         return False, failures
 
     client = supabase_client()
     client.table("quotes").update({
-        "pickup_date": str(new_pickup),
-        "return_date": str(new_return),
+        "pickup_date": pickup,
+        "return_date": ret,
         "updated_at": datetime.now().isoformat(),
     }).eq("quote_id", int(quote_id)).execute()
 
     for status in ACTIVE_RENTAL_STATUSES:
         client.table("rentals").update({
-            "pickup_date": str(new_pickup),
-            "return_date": str(new_return),
+            "pickup_date": pickup,
+            "return_date": ret,
             "updated_at": datetime.now().isoformat(),
         }).eq("quote_id", int(quote_id)).eq("status", status).execute()
 
+    update_quote_totals(quote_id, reprice=True)
+    clear_data_cache()
     return True, []
+
+
 
 
 # -----------------------------
@@ -1313,7 +1573,7 @@ def make_quote_image_bytes(quote_id):
     card_w = int((width - margin * 2 - gap_x * (cols - 1)) / cols)
     card_h = 510
     rows = max(1, math.ceil(len(items) / cols))
-    header_h = 310
+    header_h = 340
     footer_h = 390
     height = header_h + rows * card_h + max(0, rows - 1) * gap_y + footer_h + margin
 
@@ -1340,6 +1600,8 @@ def make_quote_image_bytes(quote_id):
     info_y = 205
     draw.text((margin, info_y), f"팀 이름: {quote['team_name']}", font=font_h, fill=(30, 30, 30))
     draw.text((margin, info_y + 50), f"대여 날짜: {quote['pickup_date']} ~ {quote['return_date']}", font=font_m, fill=(60, 60, 60))
+    pricing_text = pricing_summary_text(quote['pickup_date'], quote['return_date'])
+    draw.text((margin, info_y + 91), pricing_text, font=font_xs, fill=(105, 105, 105))
     qno_text = f"견적번호: {quote['quote_no']}"
     created_text = f"작성일: {quote['created_at'] or ''}"
     qno_w, _ = text_size(draw, qno_text, font_m)
@@ -1348,6 +1610,10 @@ def make_quote_image_bytes(quote_id):
     draw.text((width - margin - created_w, info_y + 44), created_text, font=font_s, fill=(100, 100, 100))
 
     start_y = header_h
+    export_multiplier = quote_price_multiplier(quote["pickup_date"], quote["return_date"])
+    export_product_nos = tuple(items["product_no"].astype(str).tolist()) if not items.empty else tuple()
+    export_status_map = bulk_product_status(export_product_nos, str(quote["pickup_date"]), str(quote["return_date"]), int(quote_id))
+    export_product_map = load_products_map(export_product_nos)
     for order, (_, item) in enumerate(items.iterrows()):
         col = order % cols
         row = order // cols
@@ -1356,12 +1622,10 @@ def make_quote_image_bytes(quote_id):
 
         draw.rounded_rectangle((x, y, x + card_w, y + card_h), radius=18, outline=(220, 220, 220), width=2, fill=(252, 252, 252))
 
-        unavailable_label = False
-        try:
-            avail, _, _ = get_available_qty(item["product_no"], quote["pickup_date"], quote["return_date"], exclude_quote_id=quote_id)
-            unavailable_label = avail <= 0 and quote.get("status") == "견적중"
-        except Exception:
-            unavailable_label = False
+        product_no = str(item["product_no"])
+        total_stock = max(safe_int((export_product_map.get(product_no) or {}).get("qty", 1), 1), 1)
+        reserved_qty = safe_int((export_status_map.get(product_no) or {}).get("reserved", 0), 0)
+        unavailable_label = (total_stock - reserved_qty <= 0) and quote.get("status") == "견적중"
         if unavailable_label:
             draw.rounded_rectangle((x + 18, y + 16, x + 116, y + 52), radius=14, fill=(253, 236, 236), outline=(217, 45, 32), width=1)
             draw.text((x + 35, y + 24), "불가능", font=font_xs, fill=(217, 45, 32))
@@ -1388,7 +1652,7 @@ def make_quote_image_bytes(quote_id):
         qty = safe_int(item["quantity"], 1)
         unit = safe_int(item["unit_price"], 0)
         line = safe_int(item["line_total"], 0)
-        draw.text((text_x, text_y + 88), f"{qty}EA x {money(unit)}", font=font_s, fill=(80, 80, 80))
+        draw.text((text_x, text_y + 88), f"{qty}EA x {money(unit)} x {export_multiplier}", font=font_s, fill=(80, 80, 80))
         draw.text((text_x, text_y + 128), money(line), font=font_mb, fill=(20, 20, 20))
 
     footer_y = header_h + rows * card_h + max(0, rows - 1) * gap_y + 92
@@ -1602,6 +1866,37 @@ def pagination_controls(total_count, page_size, state_key):
                 st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     return start, end, total_pages
+
+def render_quantity_stepper(label, current_value, max_value, key_prefix):
+    """보유수량을 넘지 않는 + / - 수량 조절기."""
+    max_value = max(safe_int(max_value, 1), 1)
+    current_value = min(max(safe_int(current_value, 1), 1), max_value)
+    state_key = f"{key_prefix}_value"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = current_value
+    st.session_state[state_key] = min(max(safe_int(st.session_state[state_key], current_value), 1), max_value)
+
+    st.caption(label)
+    c1, c2, c3 = st.columns([1, 1.4, 1])
+    with c1:
+        if st.button("−", key=f"{key_prefix}_minus", use_container_width=True):
+            if st.session_state[state_key] > 1:
+                st.session_state[state_key] -= 1
+                st.rerun()
+    with c2:
+        st.markdown(f"<div class='qty-display'>{st.session_state[state_key]}</div>", unsafe_allow_html=True)
+    with c3:
+        if st.button("+", key=f"{key_prefix}_plus", use_container_width=True):
+            if st.session_state[state_key] >= max_value:
+                try:
+                    st.toast(f"보유수량이 {max_value}개입니다.", icon="⚠️")
+                except Exception:
+                    st.warning(f"보유수량이 {max_value}개입니다.")
+            else:
+                st.session_state[state_key] += 1
+                st.rerun()
+    return int(st.session_state[state_key])
+
 
 def status_badge(text, kind="neutral"):
     colors = {
@@ -2144,13 +2439,89 @@ def render_sync_panel():
         st.rerun()
 
 
+def render_holiday_calendar_panel():
+    today = date.today()
+    if "holiday_calendar_cursor" not in st.session_state:
+        st.session_state["holiday_calendar_cursor"] = today.replace(day=1).isoformat()
+    if "holiday_draft_dates" not in st.session_state:
+        st.session_state["holiday_draft_dates"] = sorted(get_holiday_dates())
+
+    cursor = datetime.strptime(st.session_state["holiday_calendar_cursor"], "%Y-%m-%d").date().replace(day=1)
+    selected = set(st.session_state.get("holiday_draft_dates", []))
+
+    nav1, nav2, nav3 = st.columns([1, 3, 1])
+    with nav1:
+        if st.button("‹ 이전달", use_container_width=True, key="holiday_prev_month"):
+            prev = (cursor - timedelta(days=1)).replace(day=1)
+            st.session_state["holiday_calendar_cursor"] = prev.isoformat()
+            st.rerun()
+    with nav2:
+        st.markdown(f"<div class='calendar-title'>{cursor.year}년 {cursor.month}월</div>", unsafe_allow_html=True)
+    with nav3:
+        if st.button("다음달 ›", use_container_width=True, key="holiday_next_month"):
+            next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+            st.session_state["holiday_calendar_cursor"] = next_month.isoformat()
+            st.rerun()
+
+    weekday_cols = st.columns(7)
+    for col, label in zip(weekday_cols, ["월", "화", "수", "목", "금", "토", "일"]):
+        col.markdown(f"<div class='calendar-weekday'>{label}</div>", unsafe_allow_html=True)
+
+    month_rows = calendar.Calendar(firstweekday=0).monthdatescalendar(cursor.year, cursor.month)
+    for week in month_rows:
+        cols = st.columns(7)
+        for idx, day_value in enumerate(week):
+            key = day_value.isoformat()
+            in_month = day_value.month == cursor.month
+            is_sunday = day_value.weekday() == 6
+            is_selected = key in selected
+            with cols[idx]:
+                if not in_month:
+                    st.button(" ", key=f"holiday_blank_{key}", disabled=True, use_container_width=True)
+                elif is_sunday:
+                    st.button(f"{day_value.day} · OFF", key=f"holiday_sunday_{key}", disabled=True, use_container_width=True)
+                else:
+                    label = f"{day_value.day} · 휴일" if is_selected else str(day_value.day)
+                    if st.button(label, key=f"holiday_day_{key}", type="primary" if is_selected else "secondary", use_container_width=True):
+                        if is_selected:
+                            selected.discard(key)
+                        else:
+                            selected.add(key)
+                        st.session_state["holiday_draft_dates"] = sorted(selected)
+                        st.rerun()
+
+    month_selected = sorted(x for x in selected if x.startswith(f"{cursor.year:04d}-{cursor.month:02d}-"))
+    if month_selected:
+        st.caption("이번 달 휴일: " + ", ".join(month_selected))
+    else:
+        st.caption("이번 달에 추가한 휴일이 없습니다. 일요일은 항상 OFF입니다.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("휴일 저장", type="primary", use_container_width=True, key="holiday_save"):
+            save_holiday_dates(selected)
+            with st.spinner("활성 견적의 연박 가격을 다시 계산하는 중입니다..."):
+                count = recalculate_open_quotes_for_holidays()
+            st.session_state["holiday_dialog_open"] = False
+            st.success(f"휴일을 저장하고 {count}개 견적을 재계산했습니다.")
+            st.rerun()
+    with c2:
+        if st.button("닫기", use_container_width=True, key="holiday_close"):
+            st.session_state["holiday_dialog_open"] = False
+            st.rerun()
+
+
 if hasattr(st, "dialog"):
     @st.dialog("상품 동기화")
     def sync_dialog():
         render_sync_panel()
+
+    @st.dialog("휴일 캘린더", width="large")
+    def holiday_calendar_dialog():
+        render_holiday_calendar_panel()
 else:
     sync_dialog = None
-
+    holiday_calendar_dialog = None
 
 
 if hasattr(st, "dialog"):
@@ -2201,6 +2572,9 @@ if hasattr(st, "dialog"):
         if not quote:
             st.error("견적서를 찾지 못했습니다.")
             return
+        if quote.get("status") not in ["견적중", "확정"]:
+            st.info("반납이 시작된 견적서에는 상품을 추가할 수 없습니다.")
+            return
         st.markdown("<div class='dialog-scroll'>", unsafe_allow_html=True)
         st.caption(f"{quote['quote_no']} / {quote['team_name']} / {quote['pickup_date']} ~ {quote['return_date']}")
         search = st.text_input("상품 검색", key=f"dialog_add_search_{quote_id}")
@@ -2208,16 +2582,8 @@ if hasattr(st, "dialog"):
         page_key = f"dialog_add_page_{quote_id}"
         if page_key not in st.session_state:
             st.session_state[page_key] = 1
-        reset_page_when_search_changes(
-            search,
-            page_key,
-            f"dialog_add_search_tracker_{quote_id}",
-        )
+        reset_page_when_search_changes(search, page_key, f"dialog_add_search_tracker_{quote_id}")
         page_df, total_count = load_products_page(search_text=search, page=st.session_state[page_key], page_size=page_size)
-        total_pages = max(1, math.ceil(total_count / page_size))
-        if st.session_state[page_key] > total_pages:
-            st.session_state[page_key] = total_pages
-            page_df, total_count = load_products_page(search_text=search, page=st.session_state[page_key], page_size=page_size)
         existing = set(load_quote_items_df(quote_id)["product_no"].astype(str).tolist())
         product_nos = tuple(page_df["product_no"].astype(str).tolist()) if not page_df.empty else tuple()
         status_map = bulk_product_status(product_nos, str(quote["pickup_date"]), str(quote["return_date"]), int(quote_id))
@@ -2244,7 +2610,7 @@ if hasattr(st, "dialog"):
                         st.rerun()
                     else:
                         st.error(msg)
-        pagination_controls(total_count, page_size, f"dialog_add_page_{quote_id}")
+        pagination_controls(total_count, page_size, page_key)
         st.markdown("</div>", unsafe_allow_html=True)
 
     @st.dialog("견적 기본 정보 수정")
@@ -2253,25 +2619,38 @@ if hasattr(st, "dialog"):
         if not quote:
             st.error("견적서를 찾지 못했습니다.")
             return
-        st.caption(f"{quote['quote_no']} / 현재 팀명: {quote['team_name']}")
-        st.markdown("<input class='focus-guard' autofocus />", unsafe_allow_html=True)
-        edit_team = st.text_input("팀 이름", value=str(quote["team_name"] or ""), key=f"header_dialog_team_{quote_id}")
+        team_value, person_value = split_team_person(quote.get("team_name", ""))
+        st.caption(f"{quote['quote_no']} / 현재 저장명: {quote['team_name']}")
         c1, c2 = st.columns(2)
         with c1:
-            edit_pickup = st.date_input("픽업 날짜", value=parse_date_text(quote["pickup_date"]), key=f"header_dialog_pickup_{quote_id}")
+            edit_team = st.text_input("팀", value=team_value, key=f"header_dialog_team_{quote_id}")
         with c2:
-            edit_return = st.date_input("반납 날짜", value=parse_date_text(quote["return_date"]), key=f"header_dialog_return_{quote_id}")
+            edit_person = st.text_input("사람", value=person_value, key=f"header_dialog_person_{quote_id}")
+        c3, c4 = st.columns(2)
+        with c3:
+            edit_pickup = st.text_input("픽업 날짜", value=str(quote["pickup_date"]), help=date_input_help(), key=f"header_dialog_pickup_{quote_id}")
+        with c4:
+            edit_return = st.text_input("반납 날짜", value=str(quote["return_date"]), help=date_input_help(), key=f"header_dialog_return_{quote_id}")
         if st.button("수정 저장", type="primary", use_container_width=True, key=f"header_dialog_save_{quote_id}"):
-            if not edit_team.strip():
-                st.error("팀 이름을 입력해야 합니다.")
+            if not edit_team.strip() or not edit_person.strip():
+                st.error("팀과 사람 이름을 모두 입력해야 합니다.")
             else:
-                ok, failures = update_quote_header(quote_id, edit_team.strip(), edit_pickup, edit_return)
+                try:
+                    pickup = normalize_date_text(edit_pickup)
+                    ret = normalize_date_text(edit_return)
+                except Exception as e:
+                    st.error(str(e))
+                    return
+                ok, messages = update_quote_header(quote_id, combine_team_person(edit_team, edit_person), pickup, ret)
                 if ok:
                     st.success("견적 정보를 수정했습니다.")
+                    for message in messages:
+                        if message:
+                            st.info(message)
                     st.rerun()
                 else:
                     st.error("수정할 수 없습니다.")
-                    for f in failures:
+                    for f in messages:
                         st.write(f"- {f}")
 
     @st.dialog("대여 날짜 수정")
@@ -2281,25 +2660,20 @@ if hasattr(st, "dialog"):
             st.error("대여 기록을 찾지 못했습니다.")
             return
         st.caption(f"{quote['quote_no']} / {quote['team_name']}")
-        st.markdown("<input class='focus-guard' autofocus />", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            new_pickup = st.date_input("새 픽업 날짜", value=parse_date_text(quote["pickup_date"]), key=f"date_dialog_pickup_{quote_id}")
+            new_pickup = st.text_input("새 픽업 날짜", value=str(quote["pickup_date"]), help=date_input_help(), key=f"date_dialog_pickup_{quote_id}")
         with c2:
-            new_return = st.date_input("새 반납 날짜", value=parse_date_text(quote["return_date"]), key=f"date_dialog_return_{quote_id}")
+            new_return = st.text_input("새 반납 날짜", value=str(quote["return_date"]), help=date_input_help(), key=f"date_dialog_return_{quote_id}")
         if st.button("날짜 수정 저장", type="primary", use_container_width=True, key=f"date_dialog_save_{quote_id}"):
-            if new_return < new_pickup:
-                st.error("반납 날짜가 픽업 날짜보다 빠릅니다.")
+            ok, failures = update_quote_dates(int(quote_id), new_pickup, new_return)
+            if ok:
+                st.success("대여 날짜를 수정했습니다.")
+                st.rerun()
             else:
-                ok, failures = update_quote_dates(int(quote_id), new_pickup, new_return)
-                if ok:
-                    st.success("대여 날짜를 수정했습니다.")
-                    st.rerun()
-                else:
-                    st.error("날짜를 수정할 수 없습니다.")
-                    for f in failures:
-                        st.write(f"- {f}")
-
+                st.error("날짜를 수정할 수 없습니다.")
+                for f in failures:
+                    st.write(f"- {f}")
 
     @st.dialog("상품 대여 날짜 수정")
     def rental_item_date_dialog(rental_id):
@@ -2311,12 +2685,11 @@ if hasattr(st, "dialog"):
         if rental.get("status") == "반납완료":
             st.info("이미 반납완료된 상품은 날짜 수정이 필요하지 않습니다.")
             return
-        st.markdown("<input class='focus-guard' autofocus />", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            new_pickup = st.date_input("새 픽업 날짜", value=parse_date_text(rental["pickup_date"]), key=f"rental_item_pickup_{rental_id}")
+            new_pickup = st.text_input("새 픽업 날짜", value=str(rental["pickup_date"]), help=date_input_help(), key=f"rental_item_pickup_{rental_id}")
         with c2:
-            new_return = st.date_input("새 반납 날짜", value=parse_date_text(rental["return_date"]), key=f"rental_item_return_{rental_id}")
+            new_return = st.text_input("새 반납 날짜", value=str(rental["return_date"]), help=date_input_help(), key=f"rental_item_return_{rental_id}")
         if st.button("날짜 수정 저장", type="primary", use_container_width=True, key=f"rental_item_date_save_{rental_id}"):
             ok, failures = update_rental_item_dates(int(rental_id), new_pickup, new_return)
             if ok:
@@ -2332,6 +2705,7 @@ else:
     rental_date_dialog = None
     rental_item_date_dialog = None
     quote_header_dialog = None
+
 
 # -----------------------------
 # 페이지: 제품 조회
@@ -2392,45 +2766,50 @@ def add_to_current_selection(row):
             "thumbnail_url": row.get("thumbnail_url", ""),
             "quantity": 1,
             "unit_price": safe_int(row.get("price", 0), 0),
+            "stock_qty": max(safe_int(row.get("qty", 1), 1), 1),
         }
 
 
 def page_quote_create():
     init_current_quote_state()
     st.header("견적서 만들기")
+    st.caption("* 필수 입력")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns([1, 1, 1.15, 1.15])
     with c1:
-        team_name = st.text_input("팀 이름", key="create_team_name")
+        team_name = st.text_input("팀", key="create_team_name", placeholder="팀 이름 입력")
     with c2:
-        pickup_date = st.date_input("픽업 날짜", value=date.today(), key="create_pickup")
+        person_name = st.text_input("사람", key="create_person_name", placeholder="사람 이름 입력")
     with c3:
-        return_date = st.date_input("반납 날짜", value=date.today(), key="create_return")
+        pickup_raw = st.text_input("픽업 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_pickup_text")
+    with c4:
+        return_raw = st.text_input("반납 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_return_text")
 
-    if return_date < pickup_date:
-        st.error("반납 날짜가 픽업 날짜보다 빠릅니다.")
-        return
+    pickup_date = try_normalize_date_text(pickup_raw)
+    return_date = try_normalize_date_text(return_raw)
+    date_error = ""
+    if pickup_raw.strip() and not pickup_date:
+        date_error = "픽업 날짜 형식을 확인하세요."
+    elif return_raw.strip() and not return_date:
+        date_error = "반납 날짜 형식을 확인하세요."
+    elif pickup_date and return_date and return_date < pickup_date:
+        date_error = "반납 날짜가 픽업 날짜보다 빠릅니다."
+    if date_error:
+        st.warning(date_error)
+    elif pickup_date and return_date:
+        st.caption(pricing_summary_text(pickup_date, return_date))
 
-    search = st.text_input("상품 검색", key="create_product_search")
-
+    search = st.text_input("상품 검색", key="create_product_search", placeholder="상품명 입력")
     st.subheader("상품 선택")
 
     page_size = 20
     if "create_product_page" not in st.session_state:
         st.session_state["create_product_page"] = 1
-    reset_page_when_search_changes(
-        search,
-        "create_product_page",
-        "create_product_search_tracker",
-    )
+    reset_page_when_search_changes(search, "create_product_page", "create_product_search_tracker")
     page_df, total_count = load_products_page(search_text=search, page=st.session_state["create_product_page"], page_size=page_size)
-    total_pages = max(1, math.ceil(total_count / page_size))
-    if st.session_state["create_product_page"] > total_pages:
-        st.session_state["create_product_page"] = total_pages
-        page_df, total_count = load_products_page(search_text=search, page=st.session_state["create_product_page"], page_size=page_size)
 
     product_nos = tuple(page_df["product_no"].astype(str).tolist()) if not page_df.empty else tuple()
-    status_map = bulk_product_status(product_nos, str(pickup_date), str(return_date), 0)
+    status_map = bulk_product_status(product_nos, pickup_date or "", return_date or "", 0)
 
     cols = st.columns(4)
     for i, (_, row) in enumerate(page_df.iterrows()):
@@ -2440,8 +2819,8 @@ def page_quote_create():
             clicked, _, _, _ = render_product_tile(
                 row,
                 key_prefix=f"create_{st.session_state['create_product_page']}_{i}_{product_no}",
-                pickup_date=pickup_date,
-                return_date=return_date,
+                pickup_date=pickup_date or None,
+                return_date=return_date or None,
                 selected=selected,
                 select_label="선택 해제" if selected else "선택",
                 show_select=True,
@@ -2450,6 +2829,7 @@ def page_quote_create():
             if clicked:
                 if selected:
                     st.session_state["selected_quote_items"].pop(product_no, None)
+                    st.session_state.pop(f"create_qty_{product_no}_value", None)
                 else:
                     add_to_current_selection(row)
                 st.rerun()
@@ -2458,37 +2838,58 @@ def page_quote_create():
 
     st.divider()
     st.subheader("선택된 상품")
-
     selected_items = st.session_state["selected_quote_items"]
     if not selected_items:
         st.info("선택된 상품이 없습니다.")
     else:
+        selected_codes = tuple(str(x) for x in selected_items.keys())
+        selected_status = bulk_product_status(selected_codes, pickup_date or "", return_date or "", 0)
+        selected_product_map = load_products_map(selected_codes)
         remove_codes = []
+        multiplier = quote_price_multiplier(pickup_date, return_date) if pickup_date and return_date else 1
+
         for product_no, item in list(selected_items.items()):
+            product = selected_product_map.get(str(product_no)) or {}
+            stock_qty = max(safe_int(item.get("stock_qty", product.get("qty", 1)), 1), 1)
+            selected_items[product_no]["stock_qty"] = stock_qty
             with st.container(border=True):
-                cc1, cc2, cc3, cc4, cc5 = st.columns([1.1, 3, 1, 1.3, 0.8])
+                render_status_button_bar(
+                    product_no,
+                    pickup_date or None,
+                    return_date or None,
+                    key_prefix=f"selected_status_{product_no}",
+                    precomputed=selected_status.get(product_no, {"reserved": 0, "pending": 0}),
+                    total_qty_override=stock_qty,
+                )
+                cc1, cc2, cc3, cc4, cc5 = st.columns([1.1, 2.7, 1.4, 1.4, 0.8])
                 with cc1:
                     show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
                 with cc2:
                     st.markdown(f"**{item.get('name', '')}**")
                     st.caption(item.get("size_text", ""))
                     st.caption(f"상품번호: {product_no}")
+                    st.caption(f"보유수량: {stock_qty}개")
                 with cc3:
-                    qty = st.number_input("수량", min_value=1, value=safe_int(item.get("quantity", 1), 1), key=f"create_qty_{product_no}")
+                    qty = render_quantity_stepper("수량", item.get("quantity", 1), stock_qty, f"create_qty_{product_no}")
                     selected_items[product_no]["quantity"] = qty
                 with cc4:
                     price = st.number_input("단가", min_value=0, value=safe_int(item.get("unit_price", 0), 0), step=1000, key=f"create_price_{product_no}")
                     selected_items[product_no]["unit_price"] = price
-                    st.caption(f"금액: {money(qty * price)}")
+                    st.caption(f"적용 {multiplier}배")
+                    st.caption(f"금액: {money(qty * price * multiplier)}")
                 with cc5:
                     if st.button("삭제", key=f"create_remove_{product_no}"):
                         remove_codes.append(product_no)
 
         for code in remove_codes:
             selected_items.pop(code, None)
+            st.session_state.pop(f"create_qty_{code}_value", None)
             st.rerun()
 
-        subtotal = sum(safe_int(v.get("quantity", 1), 1) * safe_int(v.get("unit_price", 0), 0) for v in selected_items.values())
+        subtotal = sum(
+            safe_int(v.get("quantity", 1), 1) * safe_int(v.get("unit_price", 0), 0) * multiplier
+            for v in selected_items.values()
+        )
         vat = int(round(subtotal * 0.1))
         total = subtotal + vat
         st.markdown(f"### 합계: 공급가 {money(subtotal)} / 부가세 {money(vat)} / 총금액 {money(total)}")
@@ -2497,16 +2898,26 @@ def page_quote_create():
         c1, c2 = st.columns([1, 1])
         with c1:
             if st.button("견적서 만들기", type="primary", use_container_width=True):
-                if not team_name.strip():
-                    st.error("팀 이름을 입력해야 합니다.")
+                if not team_name.strip() or not person_name.strip():
+                    st.error("팀과 사람 이름을 모두 입력해야 합니다.")
+                elif date_error or not pickup_date or not return_date:
+                    st.error(date_error or "픽업/반납 날짜를 입력해야 합니다.")
                 else:
-                    quote_id = create_quote(team_name.strip(), pickup_date, return_date, selected_items, memo)
+                    quote_id = create_quote(
+                        combine_team_person(team_name, person_name),
+                        pickup_date,
+                        return_date,
+                        selected_items,
+                        memo,
+                    )
                     st.session_state["selected_quote_items"] = {}
                     st.session_state["last_created_quote_id"] = quote_id
                     st.success("견적서를 저장했습니다.")
                     st.rerun()
         with c2:
             if st.button("선택 초기화", use_container_width=True):
+                for code in list(st.session_state.get("selected_quote_items", {}).keys()):
+                    st.session_state.pop(f"create_qty_{code}_value", None)
                 st.session_state["selected_quote_items"] = {}
                 st.rerun()
 
@@ -2514,65 +2925,60 @@ def page_quote_create():
     if last_id:
         st.divider()
         st.subheader("방금 만든 견적서 다운로드")
-        q = get_quote(last_id)
-        if q:
+        if get_quote(last_id):
             render_quote_export_buttons(last_id, key_prefix="created_quote_export")
+
 
 
 # -----------------------------
 # 견적 상세 공통
 # -----------------------------
 
-def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="quote"):
+def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="combined"):
     quote = get_quote(quote_id)
     if not quote:
         st.error("견적서를 찾지 못했습니다.")
         return
-
     items = load_quote_items_df(quote_id)
+    status = str(quote.get("status", ""))
+    composition_editable = status in ["견적중", "확정"]
 
-    title_cols = st.columns([4, 3])
+    title_cols = st.columns([4, 4])
     with title_cols[0]:
         st.markdown(f"### {quote['quote_no']} / {quote['team_name']}")
-        st.caption(f"상태: {quote['status']} / 대여일: {quote['pickup_date']} ~ {quote['return_date']} / 총액: {money(quote['total'])}")
+        st.caption(f"상태: {status} / 대여일: {quote['pickup_date']} ~ {quote['return_date']} / 총액: {money(quote['total'])}")
+        st.caption(pricing_summary_text(quote["pickup_date"], quote["return_date"]))
     with title_cols[1]:
-        if mode == "rental":
-            b1, b2 = st.columns(2)
-            with b1:
-                if quote["status"] in ["확정", "부분반납"] and st.button("날짜 수정", use_container_width=True, key=f"{key_prefix}_top_date_{quote_id}"):
-                    if rental_date_dialog is not None:
-                        rental_date_dialog(quote_id)
-            with b2:
-                if quote["status"] != "삭제" and st.button("삭제", use_container_width=True, key=f"{key_prefix}_top_delete_{quote_id}"):
-                    delete_quote(quote_id)
-                    st.session_state["rental_detail_id"] = None
-                    st.success("삭제 처리했습니다.")
-                    st.rerun()
-        else:
-            buttons = st.columns(4)
-            with buttons[0]:
-                if allow_edit and quote["status"] == "견적중" and st.button("정보 수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}"):
-                    if quote_header_dialog is not None:
-                        quote_header_dialog(quote_id)
-            with buttons[1]:
-                if allow_edit and quote["status"] == "견적중" and st.button("제품 추가", use_container_width=True, key=f"{key_prefix}_top_add_{quote_id}"):
-                    if quote_add_product_dialog is not None:
-                        quote_add_product_dialog(quote_id)
-            with buttons[2]:
-                if quote["status"] == "견적중" and st.button("확정", type="primary", use_container_width=True, key=f"{key_prefix}_top_confirm_{quote_id}"):
+        buttons = st.columns(4)
+        with buttons[0]:
+            if st.button("정보 수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=not composition_editable):
+                if quote_header_dialog is not None:
+                    quote_header_dialog(quote_id)
+        with buttons[1]:
+            if st.button("제품 추가", use_container_width=True, key=f"{key_prefix}_top_add_{quote_id}", disabled=not composition_editable):
+                if quote_add_product_dialog is not None:
+                    quote_add_product_dialog(quote_id)
+        with buttons[2]:
+            if status != "삭제" and st.button("삭제", use_container_width=True, key=f"{key_prefix}_top_delete_{quote_id}"):
+                delete_quote(quote_id)
+                st.session_state["combined_detail_id"] = None
+                st.success("삭제 처리했습니다.")
+                st.rerun()
+        with buttons[3]:
+            if status == "견적중":
+                if st.button("확정", type="primary", use_container_width=True, key=f"{key_prefix}_top_confirm_{quote_id}"):
                     ok, failures = confirm_quote(quote_id)
                     if ok:
-                        st.success("견적서를 확정하고 대여 기록으로 넘겼습니다.")
+                        st.success("견적서를 확정했습니다.")
                         st.rerun()
                     else:
                         st.error("확정할 수 없습니다.")
                         for f in failures:
                             st.write(f"- {f}")
-            with buttons[3]:
-                if quote["status"] != "삭제" and st.button("삭제", use_container_width=True, key=f"{key_prefix}_top_delete_{quote_id}"):
-                    delete_quote(quote_id)
-                    st.session_state["quote_detail_id"] = None
-                    st.success("삭제 처리했습니다. 일반 목록에서는 보이지 않습니다.")
+            elif status in ["확정", "부분반납"]:
+                if st.button("전체 반납", type="primary", use_container_width=True, key=f"{key_prefix}_top_return_{quote_id}"):
+                    return_quote(quote_id)
+                    st.success("전체 반납 처리했습니다.")
                     st.rerun()
 
     st.markdown("#### 견적서 파일")
@@ -2582,28 +2988,54 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="qu
     if items.empty:
         st.info("상품이 없습니다.")
     else:
+        product_nos = tuple(items["product_no"].astype(str).tolist())
+        status_map = bulk_product_status(product_nos, str(quote["pickup_date"]), str(quote["return_date"]), int(quote_id))
+        product_map = load_products_map(product_nos)
         for _, item in items.iterrows():
+            product = product_map.get(str(item["product_no"])) or {}
+            stock_qty = max(safe_int(product.get("qty", 1), 1), 1)
             with st.container(border=True):
-                c1, c2, c3, c4, c5 = st.columns([1.1, 3, 1, 1.3, 0.8])
+                render_status_button_bar(
+                    item["product_no"],
+                    quote["pickup_date"],
+                    quote["return_date"],
+                    key_prefix=f"{key_prefix}_item_status_{item['id']}",
+                    exclude_quote_id=quote_id,
+                    precomputed=status_map.get(str(item["product_no"]), {"reserved": 0, "pending": 0}),
+                    total_qty_override=stock_qty,
+                )
+                c1, c2, c3, c4, c5 = st.columns([1.1, 2.7, 1.4, 1.4, 1.0])
                 with c1:
                     show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
                 with c2:
                     st.markdown(f"**{item['product_name']}**")
                     st.caption(item.get("size_text", ""))
                     st.caption(f"상품번호: {item['product_no']}")
-                if allow_edit and quote["status"] == "견적중":
+                    st.caption(f"보유수량: {stock_qty}개")
+                if composition_editable:
                     with c3:
-                        qty = st.number_input("수량", min_value=1, value=safe_int(item["quantity"], 1), key=f"{key_prefix}_qty_{item['id']}")
+                        qty = render_quantity_stepper("수량", item["quantity"], stock_qty, f"{key_prefix}_qty_{item['id']}")
                     with c4:
                         unit = st.number_input("단가", min_value=0, value=safe_int(item["unit_price"], 0), step=1000, key=f"{key_prefix}_price_{item['id']}")
-                        st.caption(f"금액: {money(qty * unit)}")
-                    if safe_int(qty, 1) != safe_int(item["quantity"], 1) or safe_int(unit, 0) != safe_int(item["unit_price"], 0):
-                        update_quote_item(item["id"], qty, unit)
-                        st.rerun()
+                        st.caption(f"적용 {quote_price_multiplier(quote['pickup_date'], quote['return_date'])}배")
+                        st.caption(f"금액: {money(calculate_line_total(qty, unit, quote['pickup_date'], quote['return_date']))}")
                     with c5:
-                        if st.button("삭제", key=f"{key_prefix}_delete_item_{item['id']}"):
-                            delete_quote_item(item["id"], quote_id)
-                            st.rerun()
+                        if st.button("변경 저장", key=f"{key_prefix}_save_item_{item['id']}", use_container_width=True):
+                            ok, msg = update_quote_item(item["id"], qty, unit)
+                            if ok:
+                                if msg:
+                                    st.info(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                        if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True):
+                            ok, msg = delete_quote_item(item["id"], quote_id)
+                            if ok:
+                                if msg:
+                                    st.info(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
                 else:
                     with c3:
                         st.write(f"수량: {item['quantity']}")
@@ -2611,20 +3043,96 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="qu
                         st.write(f"단가: {money(item['unit_price'])}")
                         st.write(f"금액: {money(item['line_total'])}")
 
+    if status in ["확정", "부분반납", "반납완료"]:
+        st.divider()
+        st.subheader("상품별 반납 / 날짜 수정")
+        rentals = load_rentals_for_quote_df(int(quote_id))
+        if rentals.empty:
+            st.info("대여 상품이 없습니다.")
+        else:
+            item_thumb = {
+                str(r["product_no"]): (str(r.get("thumbnail_path", "") or ""), str(r.get("thumbnail_url", "") or ""))
+                for _, r in items.iterrows()
+            }
+            for _, rental in rentals.iterrows():
+                if rental.get("status") == "삭제":
+                    continue
+                with st.container(border=True):
+                    c0, c1, c2, c3, c4 = st.columns([1.0, 2.8, 1.8, 1.2, 1.2])
+                    with c0:
+                        _tp, _tu = item_thumb.get(str(rental["product_no"]), ("", ""))
+                        show_thumb_from_values(_tp, _tu)
+                    with c1:
+                        st.markdown(f"**{rental['product_name']}**")
+                        st.caption(f"상품번호: {rental['product_no']}")
+                        st.caption(f"수량: {rental['quantity']}")
+                    with c2:
+                        st.caption(f"픽업 {rental['pickup_date']}")
+                        st.caption(f"반납 {rental['return_date']}")
+                        st.markdown(status_badge(str(rental["status"]), status_kind(rental["status"])), unsafe_allow_html=True)
+                    with c3:
+                        if rental["status"] == "반납완료":
+                            if st.button("반납 취소", key=f"undo_return_item_{rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(rental["id"]), returned=False)
+                                if ok:
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                        else:
+                            if st.button("반납", key=f"return_item_{rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(rental["id"]), returned=True)
+                                if ok:
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                    with c4:
+                        if rental["status"] != "반납완료" and st.button("날짜 수정", key=f"rental_item_date_{rental['id']}", use_container_width=True):
+                            if rental_item_date_dialog is not None:
+                                rental_item_date_dialog(int(rental["id"]))
+
+
 
 # -----------------------------
 # 페이지: 견적서 조회
 # -----------------------------
 
-def page_quote_list():
-    st.header("견적서 조회")
+def combined_quote_list_card(row, key_prefix="combined"):
+    thumb_path = str(row.get("first_thumb_path", "") or "")
+    thumb_url = str(row.get("first_thumb_url", "") or "")
+    with st.container(border=True):
+        c0, c1, c2, c3, c4 = st.columns([0.9, 2.0, 2.2, 2.6, 1.6])
+        with c0:
+            show_thumb_from_values(thumb_path, thumb_url) if (thumb_path or thumb_url) else st.caption("이미지 없음")
+        with c1:
+            st.markdown(f"### {row['team_name']}")
+            st.caption(str(row.get("created_at", "")))
+            st.markdown(status_badge(str(row['status']), status_kind(row['status'])), unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"**{row['quote_no']}**")
+            st.caption(f"픽업 {row['pickup_date']}")
+            st.caption(f"반납 {row['return_date']}")
+        with c3:
+            st.markdown(f"**{row.get('상품요약','')}**")
+            st.caption(f"총액 {money(row.get('total', 0))}")
+        with c4:
+            detail = st.button("상세 보기", key=f"{key_prefix}_detail_{row['quote_id']}", use_container_width=True)
+            main_action = False
+            if row["status"] == "견적중":
+                main_action = st.button("확정", type="primary", key=f"{key_prefix}_confirm_{row['quote_id']}", use_container_width=True)
+            elif row["status"] in ["확정", "부분반납"]:
+                main_action = st.button("전체 반납", type="primary", key=f"{key_prefix}_return_{row['quote_id']}", use_container_width=True)
+    return detail, main_action
 
-    detail_id = st.session_state.get("quote_detail_id")
+
+def page_quote_history():
+    st.header("견적서 조회/반납 기록")
+
+    detail_id = st.session_state.get("combined_detail_id")
     if detail_id:
-        if st.button("‹ 목록으로", key="quote_back"):
-            st.session_state["quote_detail_id"] = None
+        if st.button("‹ 목록으로", key="combined_back"):
+            st.session_state["combined_detail_id"] = None
             st.rerun()
-        render_quote_detail(int(detail_id), allow_edit=True, key_prefix="quote_detail_page")
+        render_quote_detail(int(detail_id), allow_edit=True, key_prefix="combined_detail")
         return
 
     quotes = load_quotes_df(include_deleted=False)
@@ -2632,183 +3140,69 @@ def page_quote_list():
         st.info("저장된 견적서가 없습니다.")
         return
 
-    status_filter = status_filter_control("상태 필터", ["견적중", "확정", "부분반납", "반납완료"], "quote_status_filter_v4")
+    status_filter = status_filter_control("상태 필터", ["견적중", "확정", "부분반납", "반납완료"], "combined_status_filter")
     filtered = quotes[quotes["status"] == status_filter].copy() if status_filter else quotes.copy()
 
-    search = st.text_input("팀명 / 견적번호 / 상품 요약 검색", key="quote_search")
-    if search:
-        s = search.lower()
-        filtered = filtered[
-            filtered["team_name"].astype(str).str.lower().str.contains(s, na=False) |
-            filtered["quote_no"].astype(str).str.lower().str.contains(s, na=False) |
-            filtered["상품요약"].astype(str).str.lower().str.contains(s, na=False)
-        ]
-
-    if filtered.empty:
-        st.info("조건에 맞는 견적서가 없습니다.")
-        return
-
-    filtered = filtered.reset_index(drop=True)
-    page_size = 10
-    if "quote_list_page" not in st.session_state:
-        st.session_state["quote_list_page"] = 1
-    total_pages = max(1, math.ceil(len(filtered) / page_size))
-    st.session_state["quote_list_page"] = min(max(1, st.session_state["quote_list_page"]), total_pages)
-    start = (st.session_state["quote_list_page"] - 1) * page_size
-    end = start + page_size
-    page_df = filtered.iloc[start:end]
-
-    for _, row in page_df.iterrows():
-        detail, confirm, delete = quote_list_card(row, key_prefix="quote_list")
-        if detail:
-            st.session_state["quote_detail_id"] = int(row["quote_id"])
-            st.rerun()
-        if confirm:
-            ok, failures = confirm_quote(int(row["quote_id"]))
-            if ok:
-                st.success("견적서를 확정했습니다.")
-                st.rerun()
-            else:
-                st.error("확정할 수 없습니다.")
-                for f in failures:
-                    st.write(f"- {f}")
-        if delete:
-            delete_quote(int(row["quote_id"]))
-            st.success("삭제 처리했습니다.")
-            st.rerun()
-
-    pagination_controls(len(filtered), page_size, "quote_list_page")
-
-
-# -----------------------------
-# 페이지: 대여 기록 / 반납
-# -----------------------------
-
-def page_rentals():
-    st.header("대여 기록 / 반납")
-
-    detail_id = st.session_state.get("rental_detail_id")
-    if detail_id:
-        if st.button("‹ 목록으로", key="rental_back"):
-            st.session_state["rental_detail_id"] = None
-            st.rerun()
-        quote = get_quote(int(detail_id))
-        if not quote:
-            st.error("대여 기록을 찾지 못했습니다.")
-            return
-
-        render_quote_detail(int(detail_id), allow_edit=False, key_prefix="rental_detail_page", mode="rental")
-
-        if quote["status"] in ["확정", "부분반납", "반납완료"]:
-            st.divider()
-            st.subheader("상품별 반납 / 날짜 수정")
-            rentals = load_rentals_for_quote_df(int(detail_id))
-            items = load_quote_items_df(int(detail_id))
-            if rentals.empty:
-                st.info("대여 상품이 없습니다.")
-            else:
-                item_thumb = {str(r["product_no"]): (str(r.get("thumbnail_path", "") or ""), str(r.get("thumbnail_url", "") or "")) for _, r in items.iterrows()}
-                for _, rental in rentals.iterrows():
-                    with st.container(border=True):
-                        c0, c1, c2, c3, c4 = st.columns([1.0, 2.8, 1.8, 1.2, 1.2])
-                        with c0:
-                            _tp, _tu = item_thumb.get(str(rental["product_no"]), ("", ""))
-                            show_thumb_from_values(_tp, _tu)
-                        with c1:
-                            st.markdown(f"**{rental['product_name']}**")
-                            st.caption(f"상품번호: {rental['product_no']}")
-                            st.caption(f"수량: {rental['quantity']}")
-                        with c2:
-                            st.caption(f"픽업 {rental['pickup_date']}")
-                            st.caption(f"반납 {rental['return_date']}")
-                            st.markdown(status_badge(str(rental["status"]), status_kind(rental["status"])), unsafe_allow_html=True)
-                        with c3:
-                            if rental["status"] == "반납완료":
-                                if st.button("반납 취소", key=f"undo_return_item_{rental['id']}", use_container_width=True):
-                                    ok, msg = set_rental_item_returned(int(rental["id"]), returned=False)
-                                    if ok:
-                                        st.success("반납을 취소했습니다.")
-                                        st.rerun()
-                                    else:
-                                        st.error(msg)
-                            else:
-                                if st.button("반납", key=f"return_item_{rental['id']}", use_container_width=True):
-                                    ok, msg = set_rental_item_returned(int(rental["id"]), returned=True)
-                                    if ok:
-                                        st.success("반납완료 처리했습니다.")
-                                        st.rerun()
-                                    else:
-                                        st.error(msg)
-                        with c4:
-                            if rental["status"] != "반납완료":
-                                if st.button("날짜 수정", key=f"rental_item_date_{rental['id']}", use_container_width=True):
-                                    if rental_item_date_dialog is not None:
-                                        rental_item_date_dialog(int(rental["id"]))
-                            else:
-                                st.caption("날짜 수정 없음")
-        return
-
-    quotes = load_quotes_df(include_deleted=False)
-    if quotes.empty:
-        st.info("대여 기록이 없습니다.")
-        return
-
-    rental_quotes = quotes[quotes["status"].isin(["확정", "부분반납", "반납완료"])].copy()
-    if rental_quotes.empty:
-        st.info("확정된 대여 기록이 없습니다.")
-        return
-
-    status_filter = status_filter_control("상태 필터", ["확정", "부분반납", "반납완료"], "rental_status_filter_v4")
-    filtered = rental_quotes[rental_quotes["status"] == status_filter].copy() if status_filter else rental_quotes.copy()
-
-    search = st.text_input("팀명 / 견적번호 / 상품 요약 검색", key="rental_search")
+    search = st.text_input("팀명 / 견적번호 / 상품 요약 검색", key="combined_search")
     if search:
         ss = search.lower()
         filtered = filtered[
-            filtered["team_name"].astype(str).str.lower().str.contains(ss, na=False) |
-            filtered["quote_no"].astype(str).str.lower().str.contains(ss, na=False) |
-            filtered["상품요약"].astype(str).str.lower().str.contains(ss, na=False)
+            filtered["team_name"].astype(str).str.lower().str.contains(ss, na=False)
+            | filtered["quote_no"].astype(str).str.lower().str.contains(ss, na=False)
+            | filtered["상품요약"].astype(str).str.lower().str.contains(ss, na=False)
         ]
 
-    p1, p2 = st.columns(2)
-    with p1:
-        pickup_day = st.date_input("픽업일", value=None, key="rental_pickup_day")
-    with p2:
-        return_day = st.date_input("반납일", value=None, key="rental_return_day")
-
-    if pickup_day is not None:
-        filtered = filtered[filtered["pickup_date"].astype(str) == str(pickup_day)]
-    if return_day is not None:
-        filtered = filtered[filtered["return_date"].astype(str) == str(return_day)]
+    d1, d2 = st.columns(2)
+    with d1:
+        pickup_raw = st.text_input("픽업일 조회", key="combined_pickup_filter", placeholder="YYYYMMDD")
+    with d2:
+        return_raw = st.text_input("반납일 조회", key="combined_return_filter", placeholder="YYYYMMDD")
+    pickup_filter = try_normalize_date_text(pickup_raw) if pickup_raw.strip() else ""
+    return_filter = try_normalize_date_text(return_raw) if return_raw.strip() else ""
+    if pickup_raw.strip() and not pickup_filter:
+        st.warning("픽업일 검색 형식을 확인하세요.")
+    elif pickup_filter:
+        filtered = filtered[filtered["pickup_date"].astype(str) == pickup_filter]
+    if return_raw.strip() and not return_filter:
+        st.warning("반납일 검색 형식을 확인하세요.")
+    elif return_filter:
+        filtered = filtered[filtered["return_date"].astype(str) == return_filter]
 
     if filtered.empty:
-        st.info("조건에 맞는 대여 기록이 없습니다.")
+        st.info("조건에 맞는 기록이 없습니다.")
         return
 
     filtered = filtered.reset_index(drop=True)
     page_size = 10
-    if "rental_list_page" not in st.session_state:
-        st.session_state["rental_list_page"] = 1
+    if "combined_list_page" not in st.session_state:
+        st.session_state["combined_list_page"] = 1
     total_pages = max(1, math.ceil(len(filtered) / page_size))
-    st.session_state["rental_list_page"] = min(max(1, st.session_state["rental_list_page"]), total_pages)
-    start = (st.session_state["rental_list_page"] - 1) * page_size
-    end = start + page_size
-    page_df = filtered.iloc[start:end]
+    st.session_state["combined_list_page"] = min(max(1, st.session_state["combined_list_page"]), total_pages)
+    start = (st.session_state["combined_list_page"] - 1) * page_size
+    page_df = filtered.iloc[start:start + page_size]
 
     for _, row in page_df.iterrows():
-        detail, return_all, date_edit = rental_list_card(row, key_prefix="rental_list")
+        detail, main_action = combined_quote_list_card(row)
         if detail:
-            st.session_state["rental_detail_id"] = int(row["quote_id"])
+            st.session_state["combined_detail_id"] = int(row["quote_id"])
             st.rerun()
-        if return_all:
-            return_quote(int(row["quote_id"]))
-            st.success("전체 반납 처리했습니다.")
-            st.rerun()
-        if date_edit:
-            if rental_date_dialog is not None:
-                rental_date_dialog(int(row["quote_id"]))
+        if main_action:
+            if row["status"] == "견적중":
+                ok, failures = confirm_quote(int(row["quote_id"]))
+                if ok:
+                    st.success("견적서를 확정했습니다.")
+                    st.rerun()
+                else:
+                    st.error("확정할 수 없습니다.")
+                    for f in failures:
+                        st.write(f"- {f}")
+            else:
+                return_quote(int(row["quote_id"]))
+                st.success("전체 반납 처리했습니다.")
+                st.rerun()
 
-    pagination_controls(len(filtered), page_size, "rental_list_page")
+    pagination_controls(len(filtered), page_size, "combined_list_page")
+
 
 
 # -----------------------------
@@ -2817,7 +3211,7 @@ def page_rentals():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "cloud-fix-20260619-supply-import-v4"
+APP_BUILD = "cloud-fix-20260619-unified-holiday-pricing-v1"
 require_app_password()
 
 st.markdown("""
@@ -2902,6 +3296,9 @@ h1, h2, h3 {line-height:1.25 !important; overflow:visible !important; padding-to
 .native-card-gap {height:16px;}
 .native-product-name {margin-top:14px;}
 .native-bottom-meta {margin-bottom:26px;}
+.qty-display {text-align:center; padding:10px 4px; font-size:18px; font-weight:800; background:#f5f6f8; border-radius:12px;}
+.calendar-title {text-align:center; font-size:23px; font-weight:900; padding:8px 0;}
+.calendar-weekday {text-align:center; font-weight:800; color:#555; padding:6px 0;}
 div[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-inner) {
     border-radius:24px !important;
     background:#fff !important;
@@ -2925,22 +3322,34 @@ st.sidebar.markdown("""
 <div class='sidebar-subtitle'>렌탈 재고·견적 관리</div>
 """, unsafe_allow_html=True)
 
-menu_options = ["제품 조회", "견적서 만들기", "견적서 조회", "대여 기록/반납"]
-if "menu" not in st.session_state:
-    st.session_state["menu"] = menu_options[0]
+menu_options = ["견적서 만들기", "제품 조회", "견적서 조회/반납 기록"]
+if st.session_state.get("menu") not in menu_options:
+    st.session_state["menu"] = "견적서 만들기"
 
 for opt in menu_options:
     label = f"● {opt}" if st.session_state["menu"] == opt else opt
     if st.sidebar.button(label, key=f"nav_{opt}", use_container_width=True):
         st.session_state["menu"] = opt
-        st.session_state["quote_detail_id"] = None
-        st.session_state["rental_detail_id"] = None
+        st.session_state["combined_detail_id"] = None
         st.session_state["sync_dialog_open"] = False
         st.session_state["sync_fallback_open"] = False
+        st.session_state["holiday_dialog_open"] = False
         st.rerun()
 menu = st.session_state["menu"]
 
 st.sidebar.divider()
+st.sidebar.caption(f"오늘 {date.today().strftime('%Y.%m.%d')}")
+if st.sidebar.button("휴일 캘린더", use_container_width=True, key="open_holiday_calendar"):
+    st.session_state["holiday_dialog_open"] = True
+    st.session_state["holiday_draft_dates"] = sorted(get_holiday_dates())
+
+if st.session_state.get("holiday_dialog_open"):
+    if holiday_calendar_dialog is not None:
+        holiday_calendar_dialog()
+    else:
+        with st.sidebar.expander("휴일 캘린더", expanded=True):
+            render_holiday_calendar_panel()
+
 if st.sidebar.button("상품 동기화", use_container_width=True, key="open_sync_dialog"):
     st.session_state["sync_dialog_open"] = True
 
@@ -2961,11 +3370,10 @@ if st.session_state.get("sync_fallback_open"):
 last_sync = get_meta("last_sync_at", "아직 없음")
 st.sidebar.caption(f"최근 동기화: {last_sync}")
 
-if menu == "제품 조회":
-    page_products()
-elif menu == "견적서 만들기":
+if menu == "견적서 만들기":
     page_quote_create()
-elif menu == "견적서 조회":
-    page_quote_list()
-elif menu == "대여 기록/반납":
-    page_rentals()
+elif menu == "제품 조회":
+    page_products()
+elif menu == "견적서 조회/반납 기록":
+    page_quote_history()
+
