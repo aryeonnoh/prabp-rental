@@ -2990,9 +2990,9 @@ def page_quote_create():
         with c2:
             person_name = st.text_input("사람", key="create_person_name", placeholder="사람 이름 입력")
         with c3:
-            pickup_raw = st.text_input("픽업 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_pickup_text")
+            pickup_raw = st.text_input("픽업 날짜", value="", help=date_input_help(), key="create_pickup_text", placeholder="픽업 날짜 입력")
         with c4:
-            return_raw = st.text_input("반납 날짜", value=date.today().isoformat(), help=date_input_help(), key="create_return_text")
+            return_raw = st.text_input("반납 날짜", value="", help=date_input_help(), key="create_return_text", placeholder="반납 날짜 입력")
 
     pickup_date = try_normalize_date_text(pickup_raw)
     return_date = try_normalize_date_text(return_raw)
@@ -3169,30 +3169,39 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     # 견적중은 자유 수정, 확정/부분반납은 활성 상품의 날짜/반납 조작을 같은 카드에서 처리한다.
     composition_editable = status in ["견적중", "확정", "부분반납"]
 
-    title_cols = st.columns([4, 4])
+    title_cols = st.columns([4, 2])
     with title_cols[0]:
         st.markdown(f"### {quote['quote_no']} / {quote['team_name']}")
         st.caption(f"상태: {status} / 대여일: {quote['pickup_date']} ~ {quote['return_date']} / 총액: {money(quote['total'])}")
         st.caption(pricing_summary_text(quote["pickup_date"], quote["return_date"]))
     with title_cols[1]:
-        buttons = st.columns(4)
-        with buttons[0]:
-            if st.button("정보 수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=status not in ["견적중", "확정"]):
+        top_buttons = st.columns(2)
+        with top_buttons[0]:
+            if st.button("수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=status not in ["견적중", "확정"]):
                 if quote_header_dialog is not None:
                     quote_header_dialog(quote_id)
-        with buttons[1]:
-            if st.button("제품 추가", use_container_width=True, key=f"{key_prefix}_top_add_{quote_id}", disabled=status not in ["견적중", "확정"]):
-                if quote_add_product_dialog is not None:
-                    quote_add_product_dialog(quote_id)
-        with buttons[2]:
+        with top_buttons[1]:
             if status != "삭제" and st.button("삭제", use_container_width=True, key=f"{key_prefix}_top_delete_{quote_id}"):
                 delete_quote(quote_id)
                 st.session_state["combined_detail_id"] = None
                 st.success("삭제 처리했습니다.")
                 st.rerun()
-        with buttons[3]:
+
+    st.markdown("#### 견적서 파일")
+    render_quote_export_buttons(quote_id, key_prefix=f"{key_prefix}_export")
+
+    product_head_cols = st.columns([4, 2])
+    with product_head_cols[0]:
+        st.subheader("견적 상품")
+    with product_head_cols[1]:
+        action_buttons = st.columns(2)
+        with action_buttons[0]:
+            if st.button("상품 추가", use_container_width=True, key=f"{key_prefix}_mid_add_{quote_id}", disabled=status not in ["견적중", "확정"]):
+                if quote_add_product_dialog is not None:
+                    quote_add_product_dialog(quote_id)
+        with action_buttons[1]:
             if status == "견적중":
-                if st.button("확정", type="primary", use_container_width=True, key=f"{key_prefix}_top_confirm_{quote_id}"):
+                if st.button("확정", type="primary", use_container_width=True, key=f"{key_prefix}_mid_confirm_{quote_id}"):
                     ok, failures = confirm_quote(quote_id)
                     if ok:
                         st.success("견적서를 확정했습니다.")
@@ -3202,15 +3211,10 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
                         for f in failures:
                             st.write(f"- {f}")
             elif status in ["확정", "부분반납"]:
-                if st.button("전체 반납", type="primary", use_container_width=True, key=f"{key_prefix}_top_return_{quote_id}"):
+                if st.button("전체 반납", type="primary", use_container_width=True, key=f"{key_prefix}_mid_return_{quote_id}"):
                     return_quote(quote_id)
                     st.success("전체 반납 처리했습니다.")
                     st.rerun()
-
-    st.markdown("#### 견적서 파일")
-    render_quote_export_buttons(quote_id, key_prefix=f"{key_prefix}_export")
-
-    st.subheader("견적 상품")
     if items.empty:
         st.info("상품이 없습니다.")
         return
@@ -3240,15 +3244,17 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
         item_editable = composition_editable and not item_returned
 
         with st.container(border=True):
-            render_status_button_bar(
-                product_no,
-                item_pickup,
-                item_return,
-                key_prefix=f"{key_prefix}_item_status_{item['id']}",
-                exclude_quote_id=quote_id,
-                precomputed=status_one,
-                total_qty_override=stock_qty,
-            )
+            status_cols = st.columns([2.3, 3.7])
+            with status_cols[0]:
+                render_status_button_bar(
+                    product_no,
+                    item_pickup,
+                    item_return,
+                    key_prefix=f"{key_prefix}_item_status_{item['id']}",
+                    exclude_quote_id=quote_id,
+                    precomputed=status_one,
+                    total_qty_override=stock_qty,
+                )
             c1, c2, c3, c4, c5, c6 = st.columns([1.1, 2.4, 1.2, 1.3, 1.05, 1.05])
             with c1:
                 show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
