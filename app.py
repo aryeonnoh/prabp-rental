@@ -285,7 +285,12 @@ def set_all_quote_item_dates(quote_id, pickup_date, return_date, reprice=True):
 
 
 def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
-    """견적 상품 하나의 날짜를 수정하고 해당 날짜 기준으로 가격을 다시 계산한다."""
+    """견적 상품 하나의 날짜를 수정하고 해당 날짜 기준으로 가격을 다시 계산한다.
+
+    확정/부분반납 상태에서 활성 대여가 있는 상품이면 별도 반납 카드로 다시 만들지 않고,
+    같은 상품의 활성 rentals 날짜도 같이 수정한다. 이 경우 견적 상태는 유지한다.
+    수량/가격/제품 구성 변경은 기존처럼 reopen_quote_for_edit 쪽에서 견적중으로 돌린다.
+    """
     try:
         pickup = normalize_date_text(pickup_date)
         ret = normalize_date_text(return_date)
@@ -294,32 +299,49 @@ def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
     if ret < pickup:
         return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
 
-    ok, message = reopen_quote_for_edit(quote_id)
-    if not ok:
-        return False, [message]
+    quote = get_quote(quote_id)
+    if not quote:
+        return False, ["견적서를 찾지 못했습니다."]
 
     item_rows = supabase_client().table("quote_items").select("*").eq("id", int(item_id)).limit(1).execute().data or []
     if not item_rows:
         return False, ["견적 상품을 찾지 못했습니다."]
     item = item_rows[0]
-    product = get_product(item.get("product_no")) or {}
+    product_no = str(item.get("product_no", ""))
+    product = get_product(product_no) or {}
     total_qty = max(safe_int(product.get("qty", 1), 1), 1)
     qty = max(safe_int(item.get("quantity", 1), 1), 1)
     if qty > total_qty:
         return False, [f"보유수량이 {total_qty}개입니다."]
 
+    # 확정/부분반납 상태에서는 같은 견적의 활성 대여를 제외하고 날짜 충돌을 검사한다.
+    status_one = bulk_product_status((product_no,), pickup, ret, int(quote_id)).get(product_no, {})
+    reserved = safe_int(status_one.get("reserved", 0), 0)
+    if total_qty - reserved < qty:
+        return False, [f"{item.get('product_name', product_no)}은 해당 날짜에 다른 대여와 겹칩니다. 필요 {qty}개 / 가능 {max(total_qty - reserved, 0)}개"]
+
     line_total = calculate_line_total(qty, safe_int(item.get("unit_price", 0), 0), pickup, ret)
-    supabase_client().table("quote_items").update({
+    client = supabase_client()
+    client.table("quote_items").update({
         "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
         "line_total": line_total,
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
-    update_quote_date_range_from_items(quote_id)
-    update_quote_totals(quote_id, reprice=True)
-    clear_data_cache()
-    msgs = [message] if message else []
-    return True, msgs
 
+    # 확정/부분반납 상태에서 아직 반납되지 않은 해당 상품의 rentals 날짜도 같이 수정한다.
+    if str(quote.get("status")) in ["확정", "부분반납"]:
+        for active_status in ACTIVE_RENTAL_STATUSES:
+            client.table("rentals").update({
+                "pickup_date": pickup,
+                "return_date": ret,
+                "updated_at": datetime.now().isoformat(),
+            }).eq("quote_id", int(quote_id)).eq("product_no", product_no).eq("status", active_status).execute()
+
+    update_quote_date_range_from_items(quote_id)
+    update_quote_totals(quote_id, reprice=False)
+    refresh_quote_return_status(int(quote_id))
+    clear_data_cache()
+    return True, []
 
 def pricing_summary_text(pickup_date, return_date):
     try:
@@ -1357,7 +1379,7 @@ def update_quote_item(item_id, quantity, unit_price):
         "line_total": calculate_line_total(qty, price, item_pickup, item_return),
         "updated_at": datetime.now().isoformat(),
     }).eq("id", int(item_id)).execute()
-    update_quote_totals(quote_id, reprice=True)
+    update_quote_totals(quote_id, reprice=False)
     clear_data_cache()
     return True, message or "상품 정보를 변경했습니다."
 
@@ -3108,7 +3130,8 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
         return
     items = load_quote_items_df(quote_id)
     status = str(quote.get("status", ""))
-    composition_editable = status in ["견적중", "확정"]
+    # 견적중은 자유 수정, 확정/부분반납은 활성 상품의 날짜/반납 조작을 같은 카드에서 처리한다.
+    composition_editable = status in ["견적중", "확정", "부분반납"]
 
     title_cols = st.columns([4, 4])
     with title_cols[0]:
@@ -3118,11 +3141,11 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     with title_cols[1]:
         buttons = st.columns(4)
         with buttons[0]:
-            if st.button("정보 수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=not composition_editable):
+            if st.button("정보 수정", use_container_width=True, key=f"{key_prefix}_top_edit_{quote_id}", disabled=status not in ["견적중", "확정"]):
                 if quote_header_dialog is not None:
                     quote_header_dialog(quote_id)
         with buttons[1]:
-            if st.button("제품 추가", use_container_width=True, key=f"{key_prefix}_top_add_{quote_id}", disabled=not composition_editable):
+            if st.button("제품 추가", use_container_width=True, key=f"{key_prefix}_top_add_{quote_id}", disabled=status not in ["견적중", "확정"]):
                 if quote_add_product_dialog is not None:
                     quote_add_product_dialog(quote_id)
         with buttons[2]:
@@ -3154,131 +3177,125 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     st.subheader("견적 상품")
     if items.empty:
         st.info("상품이 없습니다.")
-    else:
-        product_nos = tuple(items["product_no"].astype(str).tolist())
-        product_map = load_products_map(product_nos)
-        for _, item in items.iterrows():
-            product = product_map.get(str(item["product_no"])) or {}
-            stock_qty = max(safe_int(product.get("qty", 1), 1), 1)
-            item_pickup, item_return = get_item_dates(item, quote)
-            status_one = bulk_product_status((str(item["product_no"]),), item_pickup, item_return, int(quote_id)).get(str(item["product_no"]), {"reserved": 0, "pending": 0})
-            item_multiplier = quote_price_multiplier(item_pickup, item_return)
-            with st.container(border=True):
-                render_status_button_bar(
-                    item["product_no"],
-                    item_pickup,
-                    item_return,
-                    key_prefix=f"{key_prefix}_item_status_{item['id']}",
-                    exclude_quote_id=quote_id,
-                    precomputed=status_one,
-                    total_qty_override=stock_qty,
-                )
-                c1, c2, c3, c4, c5, c6 = st.columns([1.1, 2.4, 1.2, 1.3, 1.0, 1.0])
-                with c1:
-                    show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
-                with c2:
-                    st.markdown(f"**{item['product_name']}**")
-                    st.caption(item.get("size_text", ""))
-                    st.caption(f"상품번호: {item['product_no']}")
-                    st.caption(f"보유수량: {stock_qty}개")
-                    st.caption(f"상품 날짜: {item_pickup} ~ {item_return}")
-                if composition_editable:
-                    with c3:
-                        qty = render_quantity_stepper("수량", item["quantity"], stock_qty, f"{key_prefix}_qty_{item['id']}")
-                    with c4:
-                        unit = st.number_input("단가", min_value=0, value=safe_int(item["unit_price"], 0), step=1000, key=f"{key_prefix}_price_{item['id']}")
-                        st.caption(f"적용 {item_multiplier}배")
-                        st.caption(f"금액: {money(calculate_line_total(qty, unit, item_pickup, item_return, multiplier=item_multiplier))}")
-                    with c5:
-                        if st.button("변경 저장", key=f"{key_prefix}_save_item_{item['id']}", use_container_width=True):
-                            ok, msg = update_quote_item(item["id"], qty, unit)
-                            if ok:
-                                if msg:
-                                    st.info(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                        if st.button("날짜 수정", key=f"{key_prefix}_date_item_{item['id']}", use_container_width=True):
-                            if quote_item_date_dialog is not None:
-                                quote_item_date_dialog(int(item["id"]), int(quote_id))
-                    with c6:
-                        if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True):
-                            ok, msg = delete_quote_item(item["id"], quote_id)
-                            if ok:
-                                if msg:
-                                    st.info(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                else:
-                    with c3:
-                        st.write(f"수량: {item['quantity']}")
-                    with c4:
-                        st.write(f"단가: {money(item['unit_price'])}")
-                        st.write(f"적용 {item_multiplier}배")
-                        st.write(f"금액: {money(item['line_total'])}")
-                    with c5:
-                        if st.button("날짜 수정", key=f"{key_prefix}_date_item_readonly_{item['id']}", disabled=True, use_container_width=True):
-                            pass
+        return
 
-    if status in ["확정", "부분반납", "반납완료"]:
-        st.divider()
-        st.subheader("상품별 반납 / 날짜 수정")
-        rentals = load_rentals_for_quote_df(int(quote_id))
-        if rentals.empty:
-            st.info("대여 상품이 없습니다.")
-        else:
-            item_thumb = {
-                str(r["product_no"]): (str(r.get("thumbnail_path", "") or ""), str(r.get("thumbnail_url", "") or ""))
-                for _, r in items.iterrows()
-            }
-            for _, rental in rentals.iterrows():
-                if rental.get("status") == "삭제":
-                    continue
-                with st.container(border=True):
-                    rental_product = get_product(rental["product_no"]) or {}
-                    rental_stock_qty = max(safe_int(rental_product.get("qty", 1), 1), 1)
-                    rental_status_one = bulk_product_status((str(rental["product_no"]),), str(rental["pickup_date"]), str(rental["return_date"]), int(quote_id)).get(str(rental["product_no"]), {"reserved": 0, "pending": 0})
-                    render_status_button_bar(
-                        rental["product_no"],
-                        rental["pickup_date"],
-                        rental["return_date"],
-                        key_prefix=f"{key_prefix}_rental_status_{rental['id']}",
-                        exclude_quote_id=quote_id,
-                        precomputed=rental_status_one,
-                        total_qty_override=rental_stock_qty,
-                    )
-                    c0, c1, c2, c3, c4 = st.columns([1.0, 2.8, 1.8, 1.2, 1.2])
-                    with c0:
-                        _tp, _tu = item_thumb.get(str(rental["product_no"]), ("", ""))
-                        show_thumb_from_values(_tp, _tu)
-                    with c1:
-                        st.markdown(f"**{rental['product_name']}**")
-                        st.caption(f"상품번호: {rental['product_no']}")
-                        st.caption(f"수량: {rental['quantity']}")
-                    with c2:
-                        st.caption(f"픽업 {rental['pickup_date']}")
-                        st.caption(f"반납 {rental['return_date']}")
-                        st.markdown(status_badge(str(rental["status"]), status_kind(rental["status"])), unsafe_allow_html=True)
-                    with c3:
-                        if rental["status"] == "반납완료":
-                            if st.button("반납 취소", key=f"undo_return_item_{rental['id']}", use_container_width=True):
-                                ok, msg = set_rental_item_returned(int(rental["id"]), returned=False)
+    product_nos = tuple(items["product_no"].astype(str).tolist())
+    product_map = load_products_map(product_nos)
+    rentals_df = load_rentals_for_quote_df(int(quote_id)) if status in ["확정", "부분반납", "반납완료"] else pd.DataFrame()
+    rental_map = {}
+    if not rentals_df.empty:
+        for _, r in rentals_df.iterrows():
+            if str(r.get("status")) == "삭제":
+                continue
+            rental_map.setdefault(str(r.get("product_no")), []).append(dict(r))
+
+    for _, item in items.iterrows():
+        product_no = str(item["product_no"])
+        product = product_map.get(product_no) or {}
+        stock_qty = max(safe_int(product.get("qty", 1), 1), 1)
+        item_pickup, item_return = get_item_dates(item, quote)
+        status_one = bulk_product_status((product_no,), item_pickup, item_return, int(quote_id)).get(product_no, {"reserved": 0, "pending": 0})
+        item_multiplier = quote_price_multiplier(item_pickup, item_return)
+        related_rentals = rental_map.get(product_no, [])
+        active_rental = next((r for r in related_rentals if str(r.get("status")) in ACTIVE_RENTAL_STATUSES), None)
+        returned_rental = next((r for r in related_rentals if str(r.get("status")) == "반납완료"), None)
+        current_rental = active_rental or returned_rental
+        item_returned = bool(returned_rental and not active_rental)
+        item_editable = composition_editable and not item_returned
+
+        with st.container(border=True):
+            render_status_button_bar(
+                product_no,
+                item_pickup,
+                item_return,
+                key_prefix=f"{key_prefix}_item_status_{item['id']}",
+                exclude_quote_id=quote_id,
+                precomputed=status_one,
+                total_qty_override=stock_qty,
+            )
+            c1, c2, c3, c4, c5, c6 = st.columns([1.1, 2.4, 1.2, 1.3, 1.05, 1.05])
+            with c1:
+                show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
+            with c2:
+                st.markdown(f"**{item['product_name']}**")
+                st.caption(item.get("size_text", ""))
+                st.caption(f"상품번호: {product_no}")
+                st.caption(f"보유수량: {stock_qty}개")
+                st.caption(f"상품 날짜: {item_pickup} ~ {item_return}")
+                if current_rental:
+                    st.markdown(status_badge(str(current_rental.get("status")), status_kind(current_rental.get("status"))), unsafe_allow_html=True)
+            if item_editable:
+                with c3:
+                    qty = render_quantity_stepper("수량", item["quantity"], stock_qty, f"{key_prefix}_qty_{item['id']}")
+                with c4:
+                    unit = st.number_input("단가", min_value=0, value=safe_int(item["unit_price"], 0), step=1000, key=f"{key_prefix}_price_{item['id']}")
+                    st.caption(f"적용 {item_multiplier}배")
+                    st.caption(f"금액: {money(calculate_line_total(qty, unit, item_pickup, item_return, multiplier=item_multiplier))}")
+                with c5:
+                    if st.button("변경 저장", key=f"{key_prefix}_save_item_{item['id']}", use_container_width=True):
+                        ok, msg = update_quote_item(item["id"], qty, unit)
+                        if ok:
+                            if msg:
+                                st.info(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    if st.button("날짜 수정", key=f"{key_prefix}_date_item_{item['id']}", use_container_width=True):
+                        if quote_item_date_dialog is not None:
+                            quote_item_date_dialog(int(item["id"]), int(quote_id))
+                with c6:
+                    if status in ["확정", "부분반납", "반납완료"] and current_rental:
+                        if item_returned:
+                            if st.button("반납 취소", key=f"{key_prefix}_undo_return_item_{current_rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(current_rental["id"]), returned=False)
                                 if ok:
                                     st.rerun()
                                 else:
                                     st.error(msg)
                         else:
-                            if st.button("반납", key=f"return_item_{rental['id']}", use_container_width=True):
-                                ok, msg = set_rental_item_returned(int(rental["id"]), returned=True)
+                            if st.button("반납", key=f"{key_prefix}_return_item_{current_rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(current_rental["id"]), returned=True)
                                 if ok:
                                     st.rerun()
                                 else:
                                     st.error(msg)
-                    with c4:
-                        if rental["status"] != "반납완료" and st.button("날짜 수정", key=f"rental_item_date_{rental['id']}", use_container_width=True):
-                            if rental_item_date_dialog is not None:
-                                rental_item_date_dialog(int(rental["id"]))
+                    if st.button("제품 삭제", key=f"{key_prefix}_delete_item_{item['id']}", use_container_width=True, disabled=status not in ["견적중", "확정"]):
+                        ok, msg = delete_quote_item(item["id"], quote_id)
+                        if ok:
+                            if msg:
+                                st.info(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            else:
+                with c3:
+                    st.write(f"수량: {item['quantity']}")
+                with c4:
+                    st.write(f"단가: {money(item['unit_price'])}")
+                    st.write(f"적용 {item_multiplier}배")
+                    st.write(f"금액: {money(item['line_total'])}")
+                with c5:
+                    if status in ["확정", "부분반납", "반납완료"] and current_rental:
+                        if item_returned:
+                            if st.button("반납 취소", key=f"{key_prefix}_undo_return_item_readonly_{current_rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(current_rental["id"]), returned=False)
+                                if ok:
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                        else:
+                            if st.button("반납", key=f"{key_prefix}_return_item_readonly_{current_rental['id']}", use_container_width=True):
+                                ok, msg = set_rental_item_returned(int(current_rental["id"]), returned=True)
+                                if ok:
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                with c6:
+                    if item_returned:
+                        st.caption("반납완료")
+                    else:
+                        st.caption("수정 불가")
+
 
 
 
