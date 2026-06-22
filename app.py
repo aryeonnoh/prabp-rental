@@ -4184,10 +4184,107 @@ def match_ocr_products(candidates):
                 seen_pno.add(pno)
         cleaned.append(item)
     return cleaned
+
+
+def reset_ocr_import_state():
+    """이미지 인식 섹션만 초기화한다."""
+    prefixes = [
+        "ocr_detected_team", "ocr_detected_person", "ocr_detected_pickup", "ocr_detected_return",
+        "ocr_import_editor", "ocr_quote_image_upload_",
+    ]
+    exact_keys = [
+        "ocr_import_result", "ocr_import_add_flash", "pending_create_quote_fields",
+        "ocr_import_issue_rows", "ocr_import_issue_context",
+    ]
+    for key in exact_keys:
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            st.session_state.pop(key, None)
+    st.session_state["ocr_import_upload_seq"] = safe_int(st.session_state.get("ocr_import_upload_seq", 0), 0) + 1
+    st.session_state["ocr_import_result_id"] = safe_int(st.session_state.get("ocr_import_result_id", 0), 0) + 1
+
+
+def set_ocr_import_result(result):
+    """새 OCR 결과를 저장하고, 이전 결과 위젯 캐시를 분리한다."""
+    seq = safe_int(st.session_state.get("ocr_import_result_id", 0), 0) + 1
+    st.session_state["ocr_import_result_id"] = seq
+    # 이전 결과 입력/테이블 상태가 다음 결과에 섞이지 않게 제거한다.
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("ocr_detected_") or str(key).startswith("ocr_import_editor"):
+            st.session_state.pop(key, None)
+    result = dict(result or {})
+    result["result_id"] = seq
+    st.session_state["ocr_import_result"] = result
+
+
+def build_ocr_import_issue_rows(rows_df, pickup_date, return_date):
+    """이미지 인식 반영 상품 중 현재 날짜 기준 불가/견적중 상품을 찾는다."""
+    if rows_df is None or rows_df.empty or not pickup_date or not return_date:
+        return []
+    selected = rows_df[rows_df["선택"].astype(bool)].copy()
+    product_nos = [str(x).strip() for x in selected.get("상품번호", []).tolist() if str(x).strip()]
+    if not product_nos:
+        return []
+    status_map = bulk_product_status(tuple(product_nos), str(pickup_date), str(return_date), 0)
+    out = []
+    seen = set()
+    for _, r in selected.iterrows():
+        pno = str(r.get("상품번호", "")).strip()
+        if not pno or pno in seen:
+            continue
+        seen.add(pno)
+        stt = status_map.get(pno, {})
+        reserved = safe_int(stt.get("reserved", 0), 0)
+        pending = safe_int(stt.get("pending", 0), 0)
+        if reserved <= 0 and pending <= 0:
+            continue
+        state = "불가" if reserved > 0 else "견적중"
+        out.append({
+            "상태": state,
+            "상품번호": pno,
+            "상품명": str(r.get("매칭 상품명") or r.get("OCR 상품명") or ""),
+            "요청수량": safe_int(r.get("수량", 1), 1),
+            "확정/대여중": reserved,
+            "견적중": pending,
+        })
+    return out
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("이미지 인식 상품 상태 확인", width="large")
+    def ocr_import_issues_dialog():
+        rows = st.session_state.get("ocr_import_issue_rows") or []
+        context = st.session_state.get("ocr_import_issue_context") or {}
+        st.warning("반영한 상품 중 현재 날짜 기준으로 불가 또는 견적중인 상품이 있습니다.")
+        if context.get("pickup_date") and context.get("return_date"):
+            st.caption(f"확인 날짜: {context.get('pickup_date')} ~ {context.get('return_date')}")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("상품은 선택 목록에는 추가되어 있습니다. 견적 총액에서는 불가/견적중 상품이 제외되며, 필요하면 선택된 상품 영역에서 삭제하거나 수량을 조정하세요.")
+        if st.button("확인", type="primary", use_container_width=True, key="ocr_issue_dialog_close"):
+            st.session_state.pop("ocr_import_issue_rows", None)
+            st.session_state.pop("ocr_import_issue_context", None)
+            st.rerun()
+else:
+    ocr_import_issues_dialog = None
+
 def render_ocr_import_panel(current_pickup="", current_return=""):
     with st.expander("이미지/요청서 PNG로 상품 불러오기", expanded=False):
         st.caption("Cafe24 요청서 PNG는 하단 PRAVI_ORDER_DATA를 우선 읽고, 일반 이미지는 기존 OCR 방식으로 읽습니다.")
-        uploaded = st.file_uploader("상품 선택 이미지 업로드", type=["png", "jpg", "jpeg", "webp"], key="ocr_quote_image_upload")
+
+        action_cols = st.columns([1, 1, 3])
+        with action_cols[0]:
+            if st.button("정보 초기화", use_container_width=True, key="ocr_import_reset_btn"):
+                reset_ocr_import_state()
+                st.rerun()
+
+        upload_seq = safe_int(st.session_state.get("ocr_import_upload_seq", 0), 0)
+        uploaded = st.file_uploader(
+            "상품 선택 이미지 업로드",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"ocr_quote_image_upload_{upload_seq}",
+        )
         base_year = datetime.now().year
         base_month = datetime.now().month
         try:
@@ -4213,7 +4310,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
 
                     if order_data.get("items"):
                         matches = matches_from_pravi_order_data(order_data)
-                        st.session_state["ocr_import_result"] = {
+                        set_ocr_import_result({
                             "mode": "PRAVI 요청서",
                             "raw_text": order_text,
                             "full_text": order_text,
@@ -4225,7 +4322,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                             "person": order_data.get("person", ""),
                             "team_text": order_data.get("team_text", ""),
                             "matches": matches,
-                        }
+                        })
                     else:
                         # 2순위: 일반 이미지 OCR fallback
                         raw_text, full_text, card_text, card_count = run_ocr_analysis_from_image_bytes(image_bytes)
@@ -4234,7 +4331,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                         if not products:
                             products = parse_ocr_product_lines(full_text)
                         matches = match_ocr_products(products)
-                        st.session_state["ocr_import_result"] = {
+                        set_ocr_import_result({
                             "mode": "일반 OCR",
                             "raw_text": raw_text,
                             "full_text": full_text,
@@ -4246,7 +4343,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                             "person": "",
                             "team_text": "",
                             "matches": matches,
-                        }
+                        })
             except Exception as e:
                 st.error(f"이미지 인식 실패: {e}")
 
@@ -4254,6 +4351,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
         if not result:
             return
 
+        result_id = safe_int(result.get("result_id", st.session_state.get("ocr_import_result_id", 0)), 0)
         st.markdown("#### 인식 결과")
         mode = result.get("mode", "")
         if mode == "PRAVI 요청서":
@@ -4263,13 +4361,13 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
 
         top_cols = st.columns(4)
         with top_cols[0]:
-            detected_team = st.text_input("인식된 팀", value=result.get("team", ""), key="ocr_detected_team")
+            detected_team = st.text_input("인식된 팀", value=result.get("team", ""), key=f"ocr_detected_team_{result_id}")
         with top_cols[1]:
-            detected_person = st.text_input("인식된 사람", value=result.get("person", ""), key="ocr_detected_person")
+            detected_person = st.text_input("인식된 사람", value=result.get("person", ""), key=f"ocr_detected_person_{result_id}")
         with top_cols[2]:
-            detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key="ocr_detected_pickup")
+            detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key=f"ocr_detected_pickup_{result_id}")
         with top_cols[3]:
-            detected_return = st.text_input("인식된 반납일", value=result.get("return_date", ""), key="ocr_detected_return")
+            detected_return = st.text_input("인식된 반납일", value=result.get("return_date", ""), key=f"ocr_detected_return_{result_id}")
 
         rows = []
         for m in result.get("matches", []):
@@ -4294,11 +4392,11 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                     "선택": st.column_config.CheckboxColumn("선택"),
                     "수량": st.column_config.NumberColumn("수량", min_value=1, step=1),
                 },
-                key="ocr_import_editor",
+                key=f"ocr_import_editor_{result_id}",
             )
             col_add, col_text = st.columns([1, 1])
             with col_add:
-                if st.button("선택 상품에 추가", type="primary", use_container_width=True, key="ocr_add_to_quote"):
+                if st.button("인식 결과 반영하기", type="primary", use_container_width=True, key=f"ocr_add_to_quote_{result_id}"):
                     added = 0
                     for _, r in edited.iterrows():
                         if not bool(r.get("선택")) or not str(r.get("상품번호", "")).strip():
@@ -4313,22 +4411,34 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                         if qty > stock_qty:
                             qty = stock_qty
                         st.session_state["selected_quote_items"][pno]["quantity"] = qty
+                        # 선택된 상품 영역의 + / - 수량 표시값도 같이 맞춘다.
+                        st.session_state[f"create_qty_{pno}_value"] = qty
                         added += 1
-                    # Streamlit은 이미 생성된 text_input 위젯의 session_state 값을
-                    # 같은 실행 흐름 안에서 직접 바꾸면 오류가 난다.
-                    # 그래서 다음 rerun 시작 전에 적용할 값으로 임시 저장한다.
+
+                    # 날짜/팀명은 이미 생성된 text_input 값을 같은 실행 흐름에서 직접 바꿀 수 없어
+                    # 다음 rerun 시작 시 위젯 생성 전에 강제 반영한다.
                     pending_fields = {}
                     if detected_team:
                         pending_fields["create_team_name"] = detected_team
                     if detected_person:
                         pending_fields["create_person_name"] = detected_person
                     if detected_pickup:
-                        pending_fields["create_pickup_text"] = detected_pickup
+                        normalized = try_normalize_date_text(detected_pickup) or detected_pickup
+                        pending_fields["create_pickup_text"] = normalized
                     if detected_return:
-                        pending_fields["create_return_text"] = detected_return
+                        normalized = try_normalize_date_text(detected_return) or detected_return
+                        pending_fields["create_return_text"] = normalized
                     if pending_fields:
                         st.session_state["pending_create_quote_fields"] = pending_fields
-                    st.session_state["ocr_import_add_flash"] = f"{added}개 상품을 선택 목록에 추가했습니다."
+
+                    check_pickup = try_normalize_date_text(detected_pickup) or current_pickup or pending_fields.get("create_pickup_text", "")
+                    check_return = try_normalize_date_text(detected_return) or current_return or pending_fields.get("create_return_text", "")
+                    issues = build_ocr_import_issue_rows(edited, check_pickup, check_return)
+                    if issues:
+                        st.session_state["ocr_import_issue_rows"] = issues
+                        st.session_state["ocr_import_issue_context"] = {"pickup_date": check_pickup, "return_date": check_return}
+
+                    st.session_state["ocr_import_add_flash"] = f"{added}개 상품을 선택 목록에 반영했습니다."
                     st.rerun()
             with col_text:
                 with st.expander("인식 원문 보기"):
@@ -4547,6 +4657,8 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
 
     st.markdown("#### 견적서 파일")
     render_quote_export_buttons(quote_id, key_prefix=f"{key_prefix}_export")
+
+    render_quote_meta_editor(quote_id, key_prefix=key_prefix)
 
     product_head_cols = st.columns([4, 2])
     with product_head_cols[0]:
@@ -5437,6 +5549,54 @@ def render_quote_export_buttons(quote_id, key_prefix="quote_export"):
 
 
 
+
+
+def update_quote_meta_fields(quote_id, note="", dc_label="", dc_amount=0):
+    """견적 상세에서 메모/D.C를 수정한다. 삭제 상태만 막고, 상태 전환은 하지 않는다."""
+    quote = get_quote(quote_id)
+    if not quote:
+        return False, "견적서를 찾지 못했습니다."
+    if str(quote.get("status")) == "삭제":
+        return False, "삭제 상태의 견적서는 수정할 수 없습니다."
+    supabase_client().table("quotes").update({
+        "memo": build_quote_meta(note, dc_label, dc_amount),
+        "updated_at": datetime.now().isoformat(),
+    }).eq("quote_id", int(quote_id)).execute()
+    update_quote_totals(int(quote_id), reprice=False)
+    clear_quote_cache()
+    return True, "견적 메모/D.C를 저장했습니다."
+
+
+def render_quote_meta_editor(quote_id, key_prefix="detail"):
+    quote = get_quote(quote_id)
+    if not quote:
+        return
+    meta = parse_quote_meta(quote.get("memo", ""))
+    totals = quote_financials(int(quote_id), include_only_priceable=True)
+    disabled = str(quote.get("status")) == "삭제"
+    with st.container(border=True):
+        st.markdown("#### 견적 메모 / D.C")
+        c1, c2, c3 = st.columns([2.4, 1.4, 1.1])
+        with c1:
+            note = st.text_input("견적 메모", value=str(meta.get("note", "") or ""), key=f"{key_prefix}_meta_note_{quote_id}", disabled=disabled)
+        with c2:
+            dc_label = st.text_input("D.C 문구", value=str(meta.get("dc_label", "") or ""), placeholder="예: 기종할인50% D.C", key=f"{key_prefix}_meta_dc_label_{quote_id}", disabled=disabled)
+        with c3:
+            dc_amount = st.number_input("D.C 금액", min_value=0, value=max(safe_int(meta.get("dc_amount", 0), 0), 0), step=1000, key=f"{key_prefix}_meta_dc_amount_{quote_id}", disabled=disabled)
+        d1, d2 = st.columns([1, 3])
+        with d1:
+            if st.button("메모/D.C 저장", type="primary", use_container_width=True, key=f"{key_prefix}_meta_save_{quote_id}", disabled=disabled):
+                ok, msg = update_quote_meta_fields(quote_id, note, dc_label, dc_amount)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        with d2:
+            dc_text = f"현재 D.C: {(totals.get('dc_label') or 'D.C')} -{money(totals.get('dc_amount', 0))}" if safe_int(totals.get("dc_amount", 0), 0) else "현재 D.C 없음"
+            st.caption(f"{dc_text} · D.C는 견적 상세에서만 입력/수정합니다.")
+
+
 def apply_pending_create_quote_fields():
     """OCR/요청서 PNG에서 읽은 팀/사람/날짜 값을 위젯 생성 전에 적용한다."""
     pending = st.session_state.pop("pending_create_quote_fields", None)
@@ -5480,6 +5640,12 @@ def page_quote_create():
         st.caption(pricing_summary_text(pickup_date, return_date))
 
     render_ocr_import_panel(pickup_date or "", return_date or "")
+    if st.session_state.get("ocr_import_issue_rows"):
+        if ocr_import_issues_dialog is not None:
+            ocr_import_issues_dialog()
+        else:
+            st.warning("반영한 상품 중 현재 날짜 기준 불가 또는 견적중인 상품이 있습니다.")
+            st.dataframe(pd.DataFrame(st.session_state.get("ocr_import_issue_rows") or []), use_container_width=True, hide_index=True)
 
     search = st.text_input("상품 검색", key="create_product_search", placeholder="상품명 입력")
     st.subheader("상품 선택")
@@ -5568,20 +5734,12 @@ def page_quote_create():
         selected_items.pop(code, None)
         st.session_state.pop(f"create_qty_{code}_value", None)
         st.rerun()
-    dc_cols = st.columns([1.2, 1.0, 2.8])
-    with dc_cols[0]:
-        dc_label = st.text_input("D.C 문구", key="create_dc_label", placeholder="예: 기종할인50% D.C")
-    with dc_cols[1]:
-        dc_amount = st.number_input("D.C 금액", min_value=0, value=0, step=1000, key="create_dc_amount")
-    with dc_cols[2]:
-        memo = st.text_input("견적 메모", key="create_memo")
+    memo = st.text_input("견적 메모", key="create_memo")
     vat_preview = int(round((supply_preview + overtime_preview) * 0.1))
-    total_preview = max(supply_preview + overtime_preview + vat_preview - safe_int(dc_amount, 0), 0)
-    summary = f"공급가 {money(supply_preview)} / 연박 {money(overtime_preview)} / 부가세 {money(vat_preview)}"
-    if safe_int(dc_amount, 0):
-        summary += f" / D.C -{money(dc_amount)}"
-    summary += f" / 총금액 {money(total_preview)}"
+    total_preview = supply_preview + overtime_preview + vat_preview
+    summary = f"공급가 {money(supply_preview)} / 연박 {money(overtime_preview)} / 부가세 {money(vat_preview)} / 총금액 {money(total_preview)}"
     st.markdown(f"### 합계: {summary}")
+    st.caption("D.C는 견적 생성 후 상세 화면에서 입력/수정합니다.")
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("견적서 만들기", type="primary", use_container_width=True):
@@ -5590,7 +5748,7 @@ def page_quote_create():
             elif date_error or not pickup_date or not return_date:
                 st.error(date_error or "픽업/반납 날짜를 입력해야 합니다.")
             else:
-                quote_id = create_quote(combine_team_person(team_name, person_name), pickup_date, return_date, selected_items, memo, dc_label, dc_amount)
+                quote_id = create_quote(combine_team_person(team_name, person_name), pickup_date, return_date, selected_items, memo)
                 st.session_state["selected_quote_items"] = {}
                 st.session_state["last_created_quote_id"] = quote_id
                 st.success("견적서를 저장했습니다.")
@@ -5614,7 +5772,7 @@ def page_quote_create():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "request-png-import-v1"
+APP_BUILD = "request-png-import-v3"
 require_app_password()
 
 st.markdown("""
