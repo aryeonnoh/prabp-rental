@@ -9,4 +9,3 @@ openpyxl
 pytesseract
 opencv-python-headless
 rapidfuzz
-easyocr==1.7.2
