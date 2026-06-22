@@ -5679,6 +5679,11 @@ def page_quote_create():
     selected_items = st.session_state["selected_quote_items"]
     if not selected_items:
         st.info("선택된 상품이 없습니다.")
+        last_id = st.session_state.get("last_created_quote_id")
+        if last_id and get_quote(last_id):
+            st.divider()
+            st.subheader("방금 만든 견적서 다운로드")
+            render_quote_export_buttons(last_id, key_prefix="created_quote_export")
         return
     with st.container(border=True):
         st.markdown("**견적 정보**")
@@ -5772,7 +5777,7 @@ def page_quote_create():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "request-png-import-v3"
+APP_BUILD = "request-png-import-v4"
 require_app_password()
 
 st.markdown("""
