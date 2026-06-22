@@ -5,6 +5,7 @@ import math
 import base64
 import hashlib
 import json
+import unicodedata
 import calendar
 from html import escape
 from io import BytesIO
@@ -3609,6 +3610,217 @@ def run_ocr_analysis_from_image_bytes(image_bytes):
     return combined, full_text, card_text, card_count
 
 
+
+# -----------------------------
+# PRAVI 요청서 PNG 구조화 데이터 읽기
+# -----------------------------
+
+def normalize_filename_text(value):
+    try:
+        return unicodedata.normalize("NFC", str(value or ""))
+    except Exception:
+        return str(value or "")
+
+
+def compact_request_date(value):
+    text = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(text) == 8:
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return ""
+
+
+def split_request_team_person(text):
+    """Cafe24 요청서의 '팀명/담당자' 한 줄을 앱의 팀/사람 입력으로 나눈다."""
+    t = clean_text(normalize_filename_text(text)).replace("_", " ").strip()
+    if not t:
+        return "", ""
+    # 추천 입력값: 프라비-홍길동
+    if "-" in t:
+        left, right = t.split("-", 1)
+        return clean_text(left), clean_text(right)
+    # 예전 입력값: 에이플랜 김민주
+    parts = t.split()
+    if len(parts) >= 2:
+        return clean_text(" ".join(parts[:-1])), clean_text(parts[-1])
+    return t, ""
+
+
+def parse_pravi_request_filename(filename):
+    """프라비_요청서_프라비-홍길동_20260622-20260627.png 같은 파일명에서 정보 추출."""
+    name = normalize_filename_text(filename)
+    base = os.path.basename(name)
+    base = re.sub(r"\.[A-Za-z0-9]+$", "", base)
+    out = {"team_text": "", "team": "", "person": "", "pickup_date": "", "return_date": ""}
+    m = re.search(r"요청서[_\s-]+(.+?)[_\s]+(\d{8})\s*[-~]\s*(\d{8})", base)
+    if not m:
+        return out
+    out["team_text"] = clean_text(m.group(1))
+    out["team"], out["person"] = split_request_team_person(out["team_text"])
+    out["pickup_date"] = compact_request_date(m.group(2))
+    out["return_date"] = compact_request_date(m.group(3))
+    return out
+
+
+def preprocess_order_data_crop_for_ocr(image_bytes):
+    """요청서 하단 PRAVI_ORDER_DATA 블록 OCR 전용 crop."""
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    # 요청서 포맷은 하단 35~45%에 구조화 텍스트가 들어간다.
+    crop = img.crop((0, int(h * 0.56), w, h))
+    if cv2 is None or np is None:
+        return crop
+    arr = np.array(crop)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.convertScaleAbs(gray, alpha=1.45, beta=8)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return Image.fromarray(th)
+
+
+def run_pravi_order_data_ocr_from_image_bytes(image_bytes):
+    """Cafe24에서 생성한 요청서 PNG의 하단 데이터 블록만 OCR한다."""
+    if pytesseract is None:
+        return ""
+    img = preprocess_order_data_crop_for_ocr(image_bytes)
+    texts = []
+    for lang in ["kor+eng", "eng"]:
+        try:
+            txt = pytesseract.image_to_string(
+                img,
+                lang=lang,
+                config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+            )
+            if txt:
+                texts.append(txt)
+        except Exception:
+            pass
+    return "\n".join(texts)
+
+
+def parse_pravi_order_data_text(text, filename=""):
+    """PRAVI_ORDER_DATA_START/END 블록을 우선 파싱한다.
+
+    상품은 상품번호(product_no)를 1순위로 사용하므로 OCR이 상품명을 조금 틀려도 안정적으로 매칭된다.
+    """
+    filename_info = parse_pravi_request_filename(filename)
+    out = {
+        "is_pravi_request": False,
+        "team_text": filename_info.get("team_text", ""),
+        "team": filename_info.get("team", ""),
+        "person": filename_info.get("person", ""),
+        "pickup_date": filename_info.get("pickup_date", ""),
+        "return_date": filename_info.get("return_date", ""),
+        "items": [],
+        "raw_data_text": str(text or ""),
+    }
+    raw = normalize_filename_text(text)
+    if "PRAVI_ORDER_DATA" in raw.upper():
+        out["is_pravi_request"] = True
+
+    lines = [ocr_clean_line(x) for x in raw.splitlines()]
+    lines = [x for x in lines if x]
+
+    for line in lines:
+        u = line.upper().replace(" ", "")
+        # TEAM OCR은 한글이 깨질 수 있으므로 파일명 정보가 있으면 파일명을 우선한다.
+        m = re.search(r"TEAM\s*[=:]\s*(.+)$", line, re.IGNORECASE)
+        if m and not out["team_text"]:
+            team_text = clean_text(m.group(1))
+            # 너무 깨진 OCR 값은 무시
+            if len(re.sub(r"[^가-힣A-Za-z0-9\-\s]", "", team_text)) >= max(2, len(team_text) * 0.45):
+                out["team_text"] = team_text
+                out["team"], out["person"] = split_request_team_person(team_text)
+
+        m = re.search(r"PICKUP\s*[=:]\s*(\d{4}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{1,2}|\d{8})", line, re.IGNORECASE)
+        if m:
+            d = compact_request_date(m.group(1)) or clean_text(m.group(1)).replace("/", "-").replace(".", "-").replace(" ", "")
+            if d:
+                out["pickup_date"] = d
+        m = re.search(r"RETURN\s*[=:]\s*(\d{4}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{1,2}|\d{8})", line, re.IGNORECASE)
+        if m:
+            d = compact_request_date(m.group(1)) or clean_text(m.group(1)).replace("/", "-").replace(".", "-").replace(" ", "")
+            if d:
+                out["return_date"] = d
+
+        # ITEM=7916 | 1 | P.B - 소파 102 | W2080 D730 H700
+        if "ITEM" in u or re.match(r"^\d{3,6}\s*[|Il]", line):
+            item_line = line
+            item_line = re.sub(r"^.*?ITEM\s*[=:]\s*", "", item_line, flags=re.IGNORECASE)
+            # OCR에서 | 를 I/l/ㅣ로 읽는 경우가 있어 강제 보정
+            item_line = item_line.replace("｜", "|").replace("ㅣ", "|")
+            # product_no, qty 뒤쪽은 넉넉하게 캡처
+            m_item = re.match(r"\s*(\d{3,6})\s*[|Il]\s*(\d{1,3})\s*[|Il]\s*(.*)$", item_line)
+            if not m_item:
+                continue
+            product_no = str(int(m_item.group(1))) if m_item.group(1).isdigit() else m_item.group(1).strip()
+            qty = max(1, safe_int(m_item.group(2), 1))
+            rest = clean_text(m_item.group(3))
+            parts = [clean_text(x) for x in re.split(r"\s*[|]\s*", rest) if clean_text(x)]
+            name = parts[0] if parts else ""
+            size_text = parts[1] if len(parts) > 1 else ""
+            out["items"].append({
+                "product_no": product_no,
+                "quantity": qty,
+                "ocr_name": name,
+                "size_text": size_text,
+                "source_line": line,
+            })
+
+    # 중복 product_no는 수량 합산
+    merged = {}
+    for item in out["items"]:
+        pno = str(item.get("product_no", ""))
+        if not pno:
+            continue
+        if pno not in merged:
+            merged[pno] = dict(item)
+        else:
+            merged[pno]["quantity"] = safe_int(merged[pno].get("quantity", 1), 1) + safe_int(item.get("quantity", 1), 1)
+    out["items"] = list(merged.values())
+    if out["items"]:
+        out["is_pravi_request"] = True
+    return out
+
+
+def matches_from_pravi_order_data(order_data):
+    """PRAVI_ORDER_DATA 상품번호를 DB 상품으로 직접 매칭한다."""
+    matches = []
+    for idx, item in enumerate(order_data.get("items", []), start=1):
+        pno = str(item.get("product_no", "")).strip()
+        product = get_product(pno) if pno else None
+        qty = max(1, safe_int(item.get("quantity", 1), 1))
+        if product:
+            stock_qty = max(1, safe_int(product.get("qty", 1), 1))
+            matches.append({
+                "ocr_name": item.get("ocr_name") or product.get("name", ""),
+                "quantity": min(qty, stock_qty),
+                "source_line": item.get("source_line", ""),
+                "card_index": f"요청{idx}",
+                "status": "요청서 매칭 완료",
+                "score": 100,
+                "product_no": pno,
+                "product_name": product.get("name", ""),
+                "product_row": product,
+                "auto_select": True,
+                "match_note": "PRAVI_ORDER_DATA 상품번호 직접 매칭",
+            })
+        else:
+            matches.append({
+                "ocr_name": item.get("ocr_name", ""),
+                "quantity": qty,
+                "source_line": item.get("source_line", ""),
+                "card_index": f"요청{idx}",
+                "status": "상품번호 미등록",
+                "score": 0,
+                "product_no": pno,
+                "product_name": "",
+                "product_row": {},
+                "auto_select": False,
+                "match_note": "요청서에는 있으나 DB products에서 찾지 못함",
+            })
+    return matches
+
+
 def parse_ocr_dates(text, base_year=None, base_month=None):
     base_year = int(base_year or datetime.now().year)
     base_month = int(base_month or datetime.now().month)
@@ -3973,8 +4185,8 @@ def match_ocr_products(candidates):
         cleaned.append(item)
     return cleaned
 def render_ocr_import_panel(current_pickup="", current_return=""):
-    with st.expander("이미지로 상품 불러오기", expanded=False):
-        st.caption("이미지 안의 날짜와 상품명을 OCR로 읽은 뒤, 확인한 항목만 선택 목록에 추가합니다.")
+    with st.expander("이미지/요청서 PNG로 상품 불러오기", expanded=False):
+        st.caption("Cafe24 요청서 PNG는 하단 PRAVI_ORDER_DATA를 우선 읽고, 일반 이미지는 기존 OCR 방식으로 읽습니다.")
         uploaded = st.file_uploader("상품 선택 이미지 업로드", type=["png", "jpg", "jpeg", "webp"], key="ocr_quote_image_upload")
         base_year = datetime.now().year
         base_month = datetime.now().month
@@ -3989,43 +4201,81 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
             base_year = st.number_input("월 정보가 없는 이미지의 기준 연도", min_value=2020, max_value=2035, value=base_year, step=1, key="ocr_base_year")
         with c2:
             base_month = st.number_input("월 정보가 없는 이미지의 기준 월", min_value=1, max_value=12, value=base_month, key="ocr_base_month")
-        if uploaded is not None and st.button("OCR 실행", type="primary", key="run_ocr_import"):
+
+        if uploaded is not None and st.button("이미지 인식 실행", type="primary", key="run_ocr_import"):
             try:
-                with st.spinner("이미지에서 글자를 읽는 중입니다..."):
-                    raw_text, full_text, card_text, card_count = run_ocr_analysis_from_image_bytes(uploaded.getvalue())
-                    pickup_s, return_s = parse_ocr_dates(full_text or raw_text, base_year=base_year, base_month=base_month)
-                    products = parse_ocr_product_cards(card_text)
-                    # 카드 감지가 실패했을 때만 전체 OCR fallback 사용
-                    if not products:
-                        products = parse_ocr_product_lines(full_text)
-                    matches = match_ocr_products(products)
-                    st.session_state["ocr_import_result"] = {
-                        "raw_text": raw_text,
-                        "full_text": full_text,
-                        "card_text": card_text,
-                        "card_count": card_count,
-                        "pickup_date": pickup_s,
-                        "return_date": return_s,
-                        "matches": matches,
-                    }
+                image_bytes = uploaded.getvalue()
+                upload_name = getattr(uploaded, "name", "")
+                with st.spinner("이미지에서 요청서 데이터를 읽는 중입니다..."):
+                    # 1순위: Cafe24 요청서 PNG 하단 PRAVI_ORDER_DATA 블록
+                    order_text = run_pravi_order_data_ocr_from_image_bytes(image_bytes)
+                    order_data = parse_pravi_order_data_text(order_text, filename=upload_name)
+
+                    if order_data.get("items"):
+                        matches = matches_from_pravi_order_data(order_data)
+                        st.session_state["ocr_import_result"] = {
+                            "mode": "PRAVI 요청서",
+                            "raw_text": order_text,
+                            "full_text": order_text,
+                            "card_text": "",
+                            "card_count": len(order_data.get("items", [])),
+                            "pickup_date": order_data.get("pickup_date", ""),
+                            "return_date": order_data.get("return_date", ""),
+                            "team": order_data.get("team", ""),
+                            "person": order_data.get("person", ""),
+                            "team_text": order_data.get("team_text", ""),
+                            "matches": matches,
+                        }
+                    else:
+                        # 2순위: 일반 이미지 OCR fallback
+                        raw_text, full_text, card_text, card_count = run_ocr_analysis_from_image_bytes(image_bytes)
+                        pickup_s, return_s = parse_ocr_dates(full_text or raw_text, base_year=base_year, base_month=base_month)
+                        products = parse_ocr_product_cards(card_text)
+                        if not products:
+                            products = parse_ocr_product_lines(full_text)
+                        matches = match_ocr_products(products)
+                        st.session_state["ocr_import_result"] = {
+                            "mode": "일반 OCR",
+                            "raw_text": raw_text,
+                            "full_text": full_text,
+                            "card_text": card_text,
+                            "card_count": card_count,
+                            "pickup_date": pickup_s,
+                            "return_date": return_s,
+                            "team": "",
+                            "person": "",
+                            "team_text": "",
+                            "matches": matches,
+                        }
             except Exception as e:
-                st.error(f"OCR 실행 실패: {e}")
+                st.error(f"이미지 인식 실패: {e}")
+
         result = st.session_state.get("ocr_import_result")
         if not result:
             return
+
         st.markdown("#### 인식 결과")
-        if result.get("card_count") is not None:
+        mode = result.get("mode", "")
+        if mode == "PRAVI 요청서":
+            st.success(f"Cafe24 요청서 PNG를 인식했습니다. 상품 {len(result.get('matches', []))}개를 상품번호 기준으로 직접 매칭했습니다.")
+        elif result.get("card_count") is not None:
             st.caption(f"감지된 상품 카드: {result.get('card_count', 0)}개 · 카드당 최종 후보 1개만 표시하고, 중복 상품은 자동 제외합니다.")
-        d1, d2 = st.columns(2)
-        with d1:
+
+        top_cols = st.columns(4)
+        with top_cols[0]:
+            detected_team = st.text_input("인식된 팀", value=result.get("team", ""), key="ocr_detected_team")
+        with top_cols[1]:
+            detected_person = st.text_input("인식된 사람", value=result.get("person", ""), key="ocr_detected_person")
+        with top_cols[2]:
             detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key="ocr_detected_pickup")
-        with d2:
+        with top_cols[3]:
             detected_return = st.text_input("인식된 반납일", value=result.get("return_date", ""), key="ocr_detected_return")
+
         rows = []
         for m in result.get("matches", []):
             rows.append({
                 "선택": bool(m.get("auto_select", False)),
-                "카드": m.get("card_index", ""),
+                "구분": m.get("card_index", ""),
                 "상태": m.get("status", ""),
                 "OCR 상품명": m.get("ocr_name", ""),
                 "매칭 상품명": m.get("product_name", ""),
@@ -4064,6 +4314,10 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                             qty = stock_qty
                         st.session_state["selected_quote_items"][pno]["quantity"] = qty
                         added += 1
+                    if detected_team:
+                        st.session_state["create_team_name"] = detected_team
+                    if detected_person:
+                        st.session_state["create_person_name"] = detected_person
                     if detected_pickup:
                         st.session_state["create_pickup_text"] = detected_pickup
                     if detected_return:
@@ -4071,12 +4325,11 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                     st.success(f"{added}개 상품을 선택 목록에 추가했습니다.")
                     st.rerun()
             with col_text:
-                with st.expander("OCR 원문 보기"):
+                with st.expander("인식 원문 보기"):
                     st.text(result.get("raw_text", ""))
         else:
-            st.warning("이미지에서 상품명을 찾지 못했습니다. OCR 원문을 확인해 주세요.")
-            with st.expander("OCR 원문 보기", expanded=True):
-                st.text(result.get("raw_text", ""))
+            st.warning("인식된 상품이 없습니다. 일반 캡처 이미지는 기존 OCR 방식으로 다시 시도하거나 수동 입력이 필요합니다.")
+
 
 def page_quote_create():
     init_current_quote_state()
@@ -5340,7 +5593,7 @@ def page_quote_create():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "ocr-import-v2-card-crop"
+APP_BUILD = "request-png-import-v1"
 require_app_password()
 
 st.markdown("""
