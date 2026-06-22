@@ -4314,15 +4314,21 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                             qty = stock_qty
                         st.session_state["selected_quote_items"][pno]["quantity"] = qty
                         added += 1
+                    # Streamlit은 이미 생성된 text_input 위젯의 session_state 값을
+                    # 같은 실행 흐름 안에서 직접 바꾸면 오류가 난다.
+                    # 그래서 다음 rerun 시작 전에 적용할 값으로 임시 저장한다.
+                    pending_fields = {}
                     if detected_team:
-                        st.session_state["create_team_name"] = detected_team
+                        pending_fields["create_team_name"] = detected_team
                     if detected_person:
-                        st.session_state["create_person_name"] = detected_person
+                        pending_fields["create_person_name"] = detected_person
                     if detected_pickup:
-                        st.session_state["create_pickup_text"] = detected_pickup
+                        pending_fields["create_pickup_text"] = detected_pickup
                     if detected_return:
-                        st.session_state["create_return_text"] = detected_return
-                    st.success(f"{added}개 상품을 선택 목록에 추가했습니다.")
+                        pending_fields["create_return_text"] = detected_return
+                    if pending_fields:
+                        st.session_state["pending_create_quote_fields"] = pending_fields
+                    st.session_state["ocr_import_add_flash"] = f"{added}개 상품을 선택 목록에 추가했습니다."
                     st.rerun()
             with col_text:
                 with st.expander("인식 원문 보기"):
@@ -5430,9 +5436,24 @@ def render_quote_export_buttons(quote_id, key_prefix="quote_export"):
                 st.download_button("거래명세서 PNG 다운로드", data=st.session_state[inv_png_key], file_name=f"프라비_거래명세서_{quote.get('quote_no','')}.png", mime="image/png", use_container_width=True, key=f"{key_prefix}_download_invoice_png_{quote_id}_{signature}")
 
 
+
+def apply_pending_create_quote_fields():
+    """OCR/요청서 PNG에서 읽은 팀/사람/날짜 값을 위젯 생성 전에 적용한다."""
+    pending = st.session_state.pop("pending_create_quote_fields", None)
+    if not isinstance(pending, dict):
+        return
+    for key, value in pending.items():
+        if key in ["create_team_name", "create_person_name", "create_pickup_text", "create_return_text"]:
+            st.session_state[key] = str(value or "")
+
+
 def page_quote_create():
     init_current_quote_state()
+    apply_pending_create_quote_fields()
+    flash = st.session_state.pop("ocr_import_add_flash", "")
     st.header("견적서 만들기")
+    if flash:
+        st.success(flash)
     st.caption("* 필수 입력")
     with st.container(border=True):
         c1, c2, c3, c4 = st.columns([1, 1, 1.15, 1.15])
