@@ -26,11 +26,6 @@ except Exception:
     pytesseract = None
 
 try:
-    import easyocr
-except Exception:
-    easyocr = None
-
-try:
     import cv2
     import numpy as np
 except Exception:
@@ -3468,86 +3463,17 @@ def preprocess_crop_for_ocr(pil_img, scale=4.0):
     return Image.fromarray(th)
 
 
-@st.cache_resource(show_spinner=False)
-def get_easyocr_reader():
-    """EasyOCR reader를 1회만 로드한다.
-
-    첫 실행 때 모델 다운로드/로딩으로 시간이 오래 걸릴 수 있으므로 cache_resource로 고정한다.
-    Streamlit Cloud에서 easyocr 설치가 실패한 경우에는 None을 반환하고 Tesseract fallback을 사용한다.
-    """
-    if easyocr is None:
-        return None
-    try:
-        # gpu=False: Streamlit Cloud CPU 환경 기준
-        return easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
-    except Exception:
-        return None
-
-
-def _easyocr_lines_from_pil(pil_img, min_conf=0.12):
-    """PIL 이미지를 EasyOCR로 읽고 줄 텍스트 리스트를 반환한다."""
-    reader = get_easyocr_reader()
-    if reader is None or np is None:
-        return []
-    try:
-        arr = np.array(pil_img.convert("RGB"))
-        results = reader.readtext(arr, detail=1, paragraph=False, decoder="greedy")
-        rows = []
-        for bbox, text, conf in results:
-            if text is None:
-                continue
-            text = ocr_clean_line(text)
-            if not text:
-                continue
-            try:
-                conf_v = float(conf)
-            except Exception:
-                conf_v = 0
-            if conf_v < min_conf and len(text) <= 2:
-                continue
-            # y, x 기준으로 정렬하기 위한 좌표
-            xs = [float(p[0]) for p in bbox]
-            ys = [float(p[1]) for p in bbox]
-            rows.append({"text": text, "x": min(xs), "y": min(ys), "conf": conf_v})
-        rows.sort(key=lambda r: (round(r["y"] / 12) * 12, r["x"]))
-        return [r["text"] for r in rows]
-    except Exception:
-        return []
-
-
-def _tesseract_lines_from_pil(pil_img, config="--oem 3 --psm 6"):
-    if pytesseract is None:
-        return []
-    try:
-        txt = pytesseract.image_to_string(pil_img, lang="kor+eng", config=config)
-    except Exception:
-        try:
-            txt = pytesseract.image_to_string(pil_img, lang="eng", config=config)
-        except Exception:
-            return []
-    return [ocr_clean_line(x) for x in str(txt).splitlines() if ocr_clean_line(x)]
-
-
 def run_ocr_from_image_bytes(image_bytes):
-    """전체 이미지 OCR. 날짜와 보조 텍스트 인식용.
-
-    EasyOCR을 우선 사용하고, 실패하면 Tesseract fallback을 사용한다.
-    """
+    """전체 이미지 OCR. 날짜와 보조 텍스트 인식용."""
+    if pytesseract is None:
+        raise RuntimeError("pytesseract 패키지가 설치되어 있지 않습니다. requirements.txt와 packages.txt를 배포에 반영해 주세요.")
     img = preprocess_image_for_ocr(image_bytes)
     texts = []
-    easy_lines = _easyocr_lines_from_pil(img, min_conf=0.10)
-    if easy_lines:
-        texts.append("\n".join(easy_lines))
-
-    # 날짜 영역은 Tesseract가 더 잘 읽는 경우가 있어서 fallback/보조로 같이 붙인다.
-    if pytesseract is not None:
-        for config in ["--oem 3 --psm 6", "--oem 3 --psm 11"]:
-            lines = _tesseract_lines_from_pil(img, config=config)
-            if lines:
-                texts.append("\n".join(lines))
-
-    if not texts:
-        raise RuntimeError("OCR 엔진이 설치되어 있지 않거나 텍스트를 읽지 못했습니다. requirements.txt와 packages.txt를 확인해 주세요.")
+    for config in ["--oem 3 --psm 6", "--oem 3 --psm 11"]:
+        try:
+            texts.append(pytesseract.image_to_string(img, lang="kor+eng", config=config))
+        except Exception:
+            texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
     return "\n".join(t for t in texts if t)
 
 
@@ -3642,20 +3568,10 @@ def detect_product_card_boxes(image_bytes):
 
 
 def _ocr_pil_image(pil_img, config="--oem 3 --psm 6"):
-    """카드 crop OCR. EasyOCR 우선, Tesseract 보조."""
-    lines = _easyocr_lines_from_pil(pil_img, min_conf=0.08)
-    # EasyOCR 결과가 너무 적으면 Tesseract 보조 결과를 같이 붙인다.
-    tess_lines = []
-    if pytesseract is not None:
-        tess_lines = _tesseract_lines_from_pil(pil_img, config=config)
-    merged = []
-    seen = set()
-    for line in lines + tess_lines:
-        key = ocr_normalize_product_name(line) or ocr_clean_line(line).lower()
-        if key and key not in seen:
-            seen.add(key)
-            merged.append(line)
-    return "\n".join(merged)
+    try:
+        return pytesseract.image_to_string(pil_img, lang="kor+eng", config=config)
+    except Exception:
+        return pytesseract.image_to_string(pil_img, lang="eng", config=config)
 
 
 def run_card_ocr_from_image_bytes(image_bytes):
@@ -3664,8 +3580,8 @@ def run_card_ocr_from_image_bytes(image_bytes):
     전체 이미지를 통째로 읽는 대신, 카드 영역을 먼저 찾은 뒤 상품명/사이즈가 있는 하단부를
     크게 확대해서 읽는다. OCR 결과에는 카드 번호를 붙여 디버깅이 가능하게 한다.
     """
-    if easyocr is None and pytesseract is None:
-        raise RuntimeError("OCR 패키지가 설치되어 있지 않습니다. requirements.txt와 packages.txt를 배포에 반영해 주세요.")
+    if pytesseract is None:
+        raise RuntimeError("pytesseract 패키지가 설치되어 있지 않습니다.")
     pil = _pil_resize_for_ocr(Image.open(BytesIO(image_bytes)), max_w=2400)
     boxes = detect_product_card_boxes(image_bytes)
     texts = []
@@ -4058,7 +3974,7 @@ def match_ocr_products(candidates):
     return cleaned
 def render_ocr_import_panel(current_pickup="", current_return=""):
     with st.expander("이미지로 상품 불러오기", expanded=False):
-        st.caption("이미지 안의 날짜와 상품명을 EasyOCR로 읽은 뒤, 확인한 항목만 선택 목록에 추가합니다. 첫 실행은 모델 로딩으로 조금 오래 걸릴 수 있습니다.")
+        st.caption("이미지 안의 날짜와 상품명을 OCR로 읽은 뒤, 확인한 항목만 선택 목록에 추가합니다.")
         uploaded = st.file_uploader("상품 선택 이미지 업로드", type=["png", "jpg", "jpeg", "webp"], key="ocr_quote_image_upload")
         base_year = datetime.now().year
         base_month = datetime.now().month
