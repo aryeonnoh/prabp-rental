@@ -1,1 +1,4 @@
 fonts-noto-cjk
+tesseract-ocr
+tesseract-ocr-kor
+tesseract-ocr-eng
