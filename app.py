@@ -3642,18 +3642,27 @@ def ocr_extract_quantity_from_line(line):
         return 1
 
 
+
 def ocr_candidate_line_is_noise(line):
     t = clean_text(line)
     if not t:
         return True
-    if any(x in t for x in ["픽업", "반납", "견적", "프라비", "총금액", "공급", "세액", "CARD OCR"]):
+    noise_words = [
+        "픽업", "반납", "견적", "프라비", "총금액", "공급", "세액", "CARD OCR", "감지", "선택",
+        "사이즈", "상세페이지", "참고", "SET", "입니다", "220V", "LED", "일반", "서리악",
+    ]
+    if any(x.lower() in t.lower() for x in noise_words):
         return True
+    # 숫자/기호만 있는 경우 제거
     if re.fullmatch(r"[0-9\s./,()\-]+", t):
         return True
     # 사이즈 라인만 있는 경우 제거
     if re.search(r"\b[Ww]\s*\d+", t) and not re.search(r"[가-힣]", t.replace("W", "").replace("w", "")):
         return True
-    if re.search(r"\b[HhDd]\s*\d+", t) and len(t) < 24 and not re.search(r"[가-힣]", t):
+    if re.search(r"\b[HhDd]\s*\d+", t) and len(t) < 28 and not re.search(r"[가-힣]", t):
+        return True
+    # 너무 짧고 숫자 없는 잡음
+    if len(t) <= 2 and not re.search(r"\d", t):
         return True
     return False
 
@@ -3661,19 +3670,107 @@ def ocr_candidate_line_is_noise(line):
 def cleanup_ocr_product_tail(text):
     tail = clean_text(text)
     tail = tail.replace("—", "-").replace("–", "-").replace("－", "-")
+    tail = tail.replace("ㅣ", "1").replace("｜", "|")
     # 수량/사이즈/설명 쪽 잘라내기
     tail = re.sub(r"\s{2,}.*$", "", tail).strip()
-    tail = re.sub(r"(?:[Ww]\s*\d+|[Dd]\s*\d+|[Hh]\s*\d+).*$", "", tail).strip()
-    tail = re.sub(r"(?:사이즈|상세|참고|SET|상품|입니다).*$", "", tail).strip()
+    tail = re.sub(r"(?:[Ww]\s*\d+|[Dd]\s*\d+|[Hh]\s*\d+|Ø\s*\d+|ø\s*\d+).*$", "", tail).strip()
+    tail = re.sub(r"(?:사이즈|상세|참고|SET|상품|입니다|220V|LED).*$", "", tail, flags=re.IGNORECASE).strip()
     tail = re.sub(r"^[\-_:·•\s]+", "", tail).strip()
     tail = re.sub(r"[\|\\]+", "", tail).strip()
+    # OCR이 상품명 뒤에 붙인 잔여 괄호나 점 제거
+    tail = re.sub(r"[.,;:]+$", "", tail).strip()
     return tail
 
 
+def _ocr_split_card_blocks(text):
+    """run_card_ocr_from_image_bytes가 만든 [CARD n] 블록을 카드별로 나눈다."""
+    blocks = []
+    current_idx = None
+    current_lines = []
+    for raw in str(text or "").splitlines():
+        line = ocr_clean_line(raw)
+        m = re.match(r"^\[CARD\s+(\d+)\]", line, re.IGNORECASE)
+        if m:
+            if current_idx is not None:
+                blocks.append({"card_index": current_idx, "text": "\n".join(current_lines)})
+            current_idx = int(m.group(1))
+            current_lines = []
+        else:
+            if current_idx is not None:
+                current_lines.append(line)
+    if current_idx is not None:
+        blocks.append({"card_index": current_idx, "text": "\n".join(current_lines)})
+    return blocks
+
+
+def _make_scan_lines_for_card(block_text):
+    lines = [ocr_clean_line(x) for x in str(block_text or "").splitlines()]
+    lines = [x for x in lines if x]
+    scan_lines = []
+    for i, line in enumerate(lines):
+        scan_lines.append(line)
+        if i + 1 < len(lines):
+            scan_lines.append(line + " " + lines[i + 1])
+        if i + 2 < len(lines):
+            scan_lines.append(line + " " + lines[i + 1] + " " + lines[i + 2])
+    return scan_lines
+
+
+def _extract_candidate_names_from_line(line):
+    """한 줄에서 상품명 후보를 뽑는다. 한 줄에 여러 상품명이 섞인 경우도 분리한다."""
+    out = []
+    line = ocr_clean_line(line)
+    if ocr_candidate_line_is_noise(line):
+        return out
+
+    # 흔한 OCR 교정
+    fixed = line.replace("P8", "P.B").replace("P, B", "P.B").replace("P . B", "P.B")
+    fixed = fixed.replace("P.B_", "P.B - ").replace("P.B:", "P.B - ")
+    fixed = re.sub(r"\bP\s*[.,]?\s*B\b", "P.B", fixed, flags=re.IGNORECASE)
+
+    # 1) P.B 패턴이 있으면 그 뒤를 상품명으로 추출. 여러 개가 붙으면 다음 P.B 전까지만.
+    pb_matches = list(re.finditer(r"P\.B\s*[-_－–—]?\s*", fixed, re.IGNORECASE))
+    if pb_matches:
+        for idx, m in enumerate(pb_matches):
+            start = m.end()
+            end = pb_matches[idx + 1].start() if idx + 1 < len(pb_matches) else len(fixed)
+            tail = cleanup_ocr_product_tail(fixed[start:end])
+            # 너무 길면 상품명 끝 숫자 뒤까지만 사용
+            m2 = re.search(r"(.{0,28}?[가-힣A-Za-z]+\s*\d+(?:\s*\([^)]*\))?)", tail)
+            if m2:
+                tail = cleanup_ocr_product_tail(m2.group(1))
+            if tail and re.search(r"[가-힣A-Za-z]", tail) and re.search(r"\d", tail):
+                out.append("P.B - " + tail)
+        return out
+
+    # 2) P.B가 빠진 경우: 한글/영문 + 숫자로 끝나는 짧은 조각만 후보로 사용
+    if not (re.search(r"[가-힣A-Za-z]", fixed) and re.search(r"\d", fixed)):
+        return out
+
+    # 앞쪽 빨간 수량 제거
+    fixed = re.sub(r"^\s*\d+(?:[\.,]\d+)?\s*(?:개|ea|EA)?\s*", "", fixed).strip()
+    fixed = cleanup_ocr_product_tail(fixed)
+    if ocr_candidate_line_is_noise(fixed):
+        return out
+
+    # 한 줄에 후보가 여러 개 섞인 경우 숫자 끝 기준으로 조각화
+    parts = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9\s/().+\-]{0,24}?\d+(?:\s*\([^)]*\))?", fixed)
+    if not parts:
+        parts = [fixed]
+    for p in parts:
+        p = cleanup_ocr_product_tail(p)
+        p = re.sub(r"^[^가-힣A-Za-z]+", "", p).strip()
+        if not p or ocr_candidate_line_is_noise(p):
+            continue
+        if re.search(r"[가-힣A-Za-z]", p) and re.search(r"\d", p):
+            out.append(p)
+    return out
+
+
 def parse_ocr_product_lines(text):
+    """구버전 호환용. 전체 OCR에서 후보를 추출하되 자동선택에는 쓰지 않는다."""
     raw_lines = [ocr_clean_line(x) for x in str(text or "").splitlines()]
     lines = [x for x in raw_lines if x]
-    # 상품명이 줄바꿈되어 P.B - / 식기 32처럼 나오는 경우가 있어 인접 라인을 붙여서도 본다.
     scan_lines = []
     for i, line in enumerate(lines):
         scan_lines.append(line)
@@ -3685,40 +3782,54 @@ def parse_ocr_product_lines(text):
     found = []
     seen = set()
     for line in scan_lines:
-        if ocr_candidate_line_is_noise(line):
-            continue
         qty = ocr_extract_quantity_from_line(line)
-        matched_any = False
-
-        # P.B 표기가 인식된 경우
-        for m in re.finditer(r"P\s*\.?\s*B\s*[-_－–—]?\s*([가-힣A-Za-z0-9\s/().+\-]{1,40})", line, re.IGNORECASE):
-            name_tail = cleanup_ocr_product_tail(m.group(1))
-            if not name_tail or not re.search(r"[가-힣A-Za-z]", name_tail) or not re.search(r"\d", name_tail):
-                continue
-            product_name = "P.B - " + name_tail
-            key = ocr_normalize_product_name(product_name)
+        for name in _extract_candidate_names_from_line(line):
+            key = ocr_normalize_product_name(name)
             if key and key not in seen:
                 seen.add(key)
-                found.append({"ocr_name": product_name, "quantity": qty, "source_line": line})
-            matched_any = True
-        if matched_any:
-            continue
+                found.append({"ocr_name": name, "quantity": qty, "source_line": line, "card_index": ""})
+    return found
 
-        # P.B가 빠진 경우: 식기 32 / 장스탠드 90 같은 형태
-        if re.search(r"[가-힣]", line) and re.search(r"\d", line):
-            if len(line) <= 46:
-                cleaned = re.sub(r"^\d+(?:[\.,]\d+)?\s*(?:개)?\s*", "", line).strip()
-                cleaned = cleanup_ocr_product_tail(cleaned)
-                # 앞뒤에 붙은 OCR 잡음 제거
-                cleaned = re.sub(r"^[^가-힣A-Za-z]+", "", cleaned).strip()
-                if not cleaned or ocr_candidate_line_is_noise(cleaned):
+
+def parse_ocr_product_cards(card_text):
+    """카드 1개당 최종 후보 1개만 반환한다."""
+    blocks = _ocr_split_card_blocks(card_text)
+    found = []
+    for block in blocks:
+        card_idx = block["card_index"]
+        candidates = []
+        for line in _make_scan_lines_for_card(block["text"]):
+            qty = ocr_extract_quantity_from_line(line)
+            for name in _extract_candidate_names_from_line(line):
+                # 카드 안의 제목은 보통 짧고 끝 숫자가 있음. 너무 긴 잡음은 제거.
+                if len(name) > 38:
                     continue
-                if not re.search(r"[가-힣A-Za-z]", cleaned) or not re.search(r"\d", cleaned):
-                    continue
-                key = ocr_normalize_product_name(cleaned)
-                if key and key not in seen:
-                    seen.add(key)
-                    found.append({"ocr_name": cleaned, "quantity": qty, "source_line": line})
+                candidates.append({
+                    "ocr_name": name,
+                    "quantity": qty,
+                    "source_line": line,
+                    "card_index": card_idx,
+                })
+        # 한 카드에서 같은 정규화 후보는 하나만
+        unique = []
+        seen = set()
+        for c in candidates:
+            key = ocr_normalize_product_name(c["ocr_name"])
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(c)
+        if unique:
+            found.extend(unique)
+        else:
+            # 실패 카드도 결과에 남겨서 확인 가능하게 함
+            sample = " / ".join([x for x in _make_scan_lines_for_card(block["text"])[:3] if x])
+            found.append({
+                "ocr_name": sample[:60] if sample else "",
+                "quantity": 1,
+                "source_line": sample,
+                "card_index": card_idx,
+                "force_fail": True,
+            })
     return found
 
 
@@ -3727,7 +3838,60 @@ def ocr_trailing_number(name):
     return m.group(1) if m else ""
 
 
+def _category_token_from_name(name):
+    t = str(name or "")
+    t = re.sub(r"P\s*\.?\s*B\s*[-_－–—]?", "", t, flags=re.IGNORECASE).strip()
+    # 첫 숫자 앞까지를 카테고리 토큰으로 사용
+    m = re.match(r"([가-힣A-Za-z]+)", t.replace(" ", ""))
+    return m.group(1) if m else ""
+
+
+def _match_one_ocr_name(ocr_name, db_candidates, exact, choices, by_tail):
+    norm = ocr_normalize_product_name(ocr_name)
+    tail = ocr_trailing_number(ocr_name)
+    cat = _category_token_from_name(ocr_name)
+    matched = None
+    score = 0
+    status = "매칭 실패"
+    reason = ""
+
+    if not norm or not tail:
+        return None, 0, "매칭 실패", "상품명 또는 끝 번호 인식 실패"
+
+    if norm in exact:
+        return exact[norm], 100, "매칭 완료", "정확히 일치"
+
+    if rf_process is None or not choices:
+        return None, 0, "매칭 실패", "유사도 매칭 불가"
+
+    # 끝 번호가 같은 후보군 안에서만 우선 매칭. 끝 번호가 다르면 오매칭이 많아서 자동 후보에서 제외.
+    tail_candidates = by_tail.get(tail, []) if tail else []
+    if tail_candidates:
+        # 카테고리 토큰이 포함되는 후보를 우선
+        scoped = tail_candidates
+        if cat:
+            cat_scoped = [c for c in tail_candidates if cat in _category_token_from_name(c.get("name", "")) or _category_token_from_name(c.get("name", "")) in cat]
+            if cat_scoped:
+                scoped = cat_scoped
+        tail_choices = {c["norm"]: c for c in scoped}
+        best = rf_process.extractOne(norm, list(tail_choices.keys()), scorer=rf_fuzz.WRatio)
+        if best:
+            best_key, score, _ = best
+            if score >= 72:
+                return tail_choices[best_key], int(score), "후보 매칭", "끝 번호 일치"
+            return None, int(score), "매칭 실패", "끝 번호는 같지만 유사도 낮음"
+
+    # 끝 번호가 다르면 아주 높은 유사도만 후보로 표시하되 자동선택은 하지 않음
+    best = rf_process.extractOne(norm, list(choices.keys()), scorer=rf_fuzz.WRatio)
+    if best:
+        best_key, score, _ = best
+        if score >= 92:
+            return choices[best_key], int(score), "확인 필요", "끝 번호 불일치 가능성"
+    return None, int(score or 0), "매칭 실패", "DB 후보 없음"
+
+
 def match_ocr_products(candidates):
+    """카드별 후보를 매칭하고, 카드당 1개/상품당 1개만 자동 선택되도록 정리한다."""
     db_candidates = load_ocr_product_candidates()
     exact = {c["norm"]: c for c in db_candidates}
     choices = {c["norm"]: c for c in db_candidates}
@@ -3738,51 +3902,76 @@ def match_ocr_products(candidates):
         if tail:
             by_tail.setdefault(tail, []).append(c)
 
-    results = []
+    # 먼저 모든 후보 점수 계산
+    enriched = []
     for item in candidates:
-        ocr_name = item.get("ocr_name", "")
-        norm = ocr_normalize_product_name(ocr_name)
-        tail = ocr_trailing_number(ocr_name)
-        matched = None
-        score = 0
-        status = "매칭 실패"
-
-        if norm in exact:
-            matched = exact[norm]
-            score = 100
-            status = "매칭 완료"
-        elif rf_process is not None:
-            # 상품번호 끝 숫자가 같으면 그 후보군 안에서 먼저 찾는다.
-            tail_candidates = by_tail.get(tail, []) if tail else []
-            if tail_candidates:
-                tail_choices = {c["norm"]: c for c in tail_candidates}
-                best = rf_process.extractOne(norm, list(tail_choices.keys()), scorer=rf_fuzz.WRatio)
-                if best:
-                    best_key, score, _ = best
-                    # 끝 번호가 같으면 OCR 글자 일부가 틀려도 후보로 인정
-                    if score >= 52:
-                        matched = tail_choices[best_key]
-                        status = "후보 매칭"
-            if matched is None and choices:
-                best = rf_process.extractOne(norm, list(choices.keys()), scorer=rf_fuzz.WRatio)
-                if best:
-                    best_key, score, _ = best
-                    if score >= 78:
-                        matched = choices[best_key]
-                        status = "후보 매칭"
-
-        result = dict(item)
-        result.update({
+        item = dict(item)
+        if item.get("force_fail"):
+            item.update({
+                "status": "매칭 실패", "score": 0, "product_no": "", "product_name": "", "product_row": {},
+                "auto_select": False, "match_note": "카드 텍스트 인식 실패",
+            })
+            enriched.append(item)
+            continue
+        matched, score, status, reason = _match_one_ocr_name(item.get("ocr_name", ""), db_candidates, exact, choices, by_tail)
+        qty = max(1, safe_int(item.get("quantity", 1), 1))
+        auto_select = bool(matched) and status in ["매칭 완료", "후보 매칭"] and score >= 82 and qty <= 10
+        if qty > 10:
+            status = "확인 필요"
+            reason = "수량 확인 필요"
+            auto_select = False
+        item.update({
             "status": status,
             "score": int(score or 0),
             "product_no": matched["product_no"] if matched else "",
             "product_name": matched["name"] if matched else "",
             "product_row": matched["row"] if matched else {},
+            "auto_select": auto_select,
+            "match_note": reason,
         })
-        results.append(result)
-    return results
+        enriched.append(item)
 
+    # 카드별 최종 1개만 남김: 매칭 완료 > 후보 매칭 > 확인 필요 > 실패, 점수 높은 순
+    by_card = {}
+    no_card = []
+    rank = {"매칭 완료": 0, "후보 매칭": 1, "확인 필요": 2, "매칭 실패": 3}
+    for item in enriched:
+        ci = item.get("card_index")
+        if ci in [None, ""]:
+            no_card.append(item)
+            continue
+        by_card.setdefault(ci, []).append(item)
 
+    final = []
+    for ci, items in sorted(by_card.items(), key=lambda x: int(x[0])):
+        items = sorted(items, key=lambda x: (rank.get(x.get("status"), 9), -safe_int(x.get("score", 0), 0)))
+        chosen = items[0]
+        chosen["candidate_count_in_card"] = len(items)
+        if len(items) > 1 and chosen.get("status") != "매칭 실패":
+            chosen["match_note"] = (chosen.get("match_note") or "") + f" / 카드 내 후보 {len(items)}개"
+        final.append(chosen)
+
+    # 카드 없는 fallback 후보는 자동 선택하지 않고 참고로만 추가
+    for item in no_card:
+        item["auto_select"] = False
+        item["status"] = "확인 필요" if item.get("product_no") else "매칭 실패"
+        item["match_note"] = (item.get("match_note") or "") + " / 전체 OCR 후보"
+        final.append(item)
+
+    # 같은 상품이 여러 카드에서 중복 매칭되면 첫 번째만 자동 선택
+    seen_pno = set()
+    cleaned = []
+    for item in final:
+        pno = str(item.get("product_no") or "")
+        if pno:
+            if pno in seen_pno:
+                item["status"] = "중복 제외"
+                item["auto_select"] = False
+                item["match_note"] = "같은 상품이 이미 선택됨"
+            else:
+                seen_pno.add(pno)
+        cleaned.append(item)
+    return cleaned
 def render_ocr_import_panel(current_pickup="", current_return=""):
     with st.expander("이미지로 상품 불러오기", expanded=False):
         st.caption("이미지 안의 날짜와 상품명을 OCR로 읽은 뒤, 확인한 항목만 선택 목록에 추가합니다.")
@@ -3805,7 +3994,10 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
                 with st.spinner("이미지에서 글자를 읽는 중입니다..."):
                     raw_text, full_text, card_text, card_count = run_ocr_analysis_from_image_bytes(uploaded.getvalue())
                     pickup_s, return_s = parse_ocr_dates(full_text or raw_text, base_year=base_year, base_month=base_month)
-                    products = parse_ocr_product_lines(raw_text)
+                    products = parse_ocr_product_cards(card_text)
+                    # 카드 감지가 실패했을 때만 전체 OCR fallback 사용
+                    if not products:
+                        products = parse_ocr_product_lines(full_text)
                     matches = match_ocr_products(products)
                     st.session_state["ocr_import_result"] = {
                         "raw_text": raw_text,
@@ -3823,7 +4015,7 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
             return
         st.markdown("#### 인식 결과")
         if result.get("card_count") is not None:
-            st.caption(f"감지된 상품 카드: {result.get('card_count', 0)}개 · 카드별 OCR을 우선 사용합니다.")
+            st.caption(f"감지된 상품 카드: {result.get('card_count', 0)}개 · 카드당 최종 후보 1개만 표시하고, 중복 상품은 자동 제외합니다.")
         d1, d2 = st.columns(2)
         with d1:
             detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key="ocr_detected_pickup")
@@ -3832,13 +4024,15 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
         rows = []
         for m in result.get("matches", []):
             rows.append({
-                "선택": bool(m.get("product_no")),
+                "선택": bool(m.get("auto_select", False)),
+                "카드": m.get("card_index", ""),
                 "상태": m.get("status", ""),
                 "OCR 상품명": m.get("ocr_name", ""),
                 "매칭 상품명": m.get("product_name", ""),
                 "상품번호": m.get("product_no", ""),
                 "수량": int(max(1, safe_int(m.get("quantity", 1), 1))),
                 "유사도": m.get("score", 0),
+                "확인메모": m.get("match_note", ""),
             })
         if rows:
             edited = st.data_editor(
