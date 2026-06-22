@@ -6,3 +6,6 @@ beautifulsoup4
 supabase
 reportlab
 openpyxl
+pytesseract
+opencv-python-headless
+rapidfuzz
