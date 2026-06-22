@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client
@@ -339,9 +340,65 @@ def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
 def pricing_summary_text(pickup_date, return_date):
     try:
         ctx = rental_pricing_context(pickup_date, return_date)
-        return f"청구 영업일 {ctx['billable_days']}일 · 기본 {ctx['base_multiplier']}배 · 연박 +{ctx['extra_days']}일 · 적용 {ctx['multiplier']}배"
+        billable = ctx.get("billable_days", 0)
+        multiplier = ctx.get("multiplier", 1)
+        extra = ctx.get("extra_days", 0)
+        if extra and extra > 0:
+            return f"요금 기준: 일요일/휴일 제외 {billable}일 청구 · 기본 2일 + 추가 {extra}일 · 단가 {multiplier}배 적용"
+        return f"요금 기준: 일요일/휴일 제외 {billable}일 청구 · 단가 {multiplier}배 적용"
     except Exception:
-        return "날짜를 입력하면 연박 가격이 계산됩니다."
+        return "날짜를 입력하면 요금 기준이 계산됩니다."
+
+
+def format_datetime_short(value):
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "nat"}:
+        return ""
+    try:
+        dt = pd.to_datetime(text)
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        text = text.replace("T", " ")
+        text = re.sub(r"\.\d+", "", text)
+        text = re.sub(r"\+00:00$", "", text)
+        return text[:19]
+
+
+def valid_status_text(value):
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "nat"}:
+        return ""
+    return text
+
+
+def render_quote_detail_header(quote):
+    status = valid_status_text(quote.get("status")) or "견적중"
+    created = format_datetime_short(quote.get("created_at"))
+    st.markdown(f"""
+    <div class='quote-detail-head'>
+        <div class='quote-status-line'>{status_badge(status, status_kind(status))}</div>
+        <div class='quote-title-line'>{escape(str(quote.get('quote_no', '')))} / {escape(str(quote.get('team_name', '')))}</div>
+        <div class='quote-meta-grid'>
+            <div><span>대여일</span><strong>{escape(str(quote.get('pickup_date', '')))} ~ {escape(str(quote.get('return_date', '')))}</strong></div>
+            <div><span>총액</span><strong>{escape(money(quote.get('total', 0)))}</strong></div>
+            <div><span>작성일</span><strong>{escape(created or '-')}</strong></div>
+        </div>
+        <div class='quote-pricing-line'>{escape(pricing_summary_text(quote.get('pickup_date'), quote.get('return_date')))}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def scroll_to_top_once():
+    if st.session_state.pop("scroll_to_top", False):
+        components.html("""
+        <script>
+        setTimeout(function(){
+            try { window.parent.scrollTo({top: 0, behavior: 'smooth'}); } catch(e) { window.parent.scrollTo(0, 0); }
+        }, 80);
+        </script>
+        """, height=0)
 
 
 # -----------------------------
@@ -1774,7 +1831,7 @@ def make_quote_image_bytes(quote_id):
     pricing_text = pricing_summary_text(quote['pickup_date'], quote['return_date'])
     draw.text((margin, info_y + 91), pricing_text, font=font_xs, fill=(105, 105, 105))
     qno_text = f"견적번호: {quote['quote_no']}"
-    created_text = f"작성일: {quote['created_at'] or ''}"
+    created_text = f"작성일: {format_datetime_short(quote.get('created_at'))}"
     qno_w, _ = text_size(draw, qno_text, font_m)
     created_w, _ = text_size(draw, created_text, font_s)
     draw.text((width - margin - qno_w, info_y), qno_text, font=font_m, fill=(60, 60, 60))
@@ -2239,8 +2296,10 @@ def quote_list_card(row, key_prefix="quote"):
                 st.caption("이미지 없음")
         with c1:
             st.markdown(f"### {row['team_name']}")
-            st.caption(str(row.get("created_at", "")))
-            st.markdown(status_badge(str(row['status']), status_kind(row['status'])), unsafe_allow_html=True)
+            st.caption(format_datetime_short(row.get("created_at", "")))
+            _status_label = valid_status_text(row.get("status"))
+            if _status_label:
+                st.markdown(status_badge(_status_label, status_kind(_status_label)), unsafe_allow_html=True)
         with c2:
             st.markdown(f"**{row['quote_no']}**")
             st.caption(f"픽업 {row['pickup_date']}")
@@ -2271,8 +2330,10 @@ def rental_list_card(row, key_prefix="rental"):
                 st.caption("이미지 없음")
         with c1:
             st.markdown(f"### {row['team_name']}")
-            st.caption(str(row.get("created_at", "")))
-            st.markdown(status_badge(str(row['status']), status_kind(row['status'])), unsafe_allow_html=True)
+            st.caption(format_datetime_short(row.get("created_at", "")))
+            _status_label = valid_status_text(row.get("status"))
+            if _status_label:
+                st.markdown(status_badge(_status_label, status_kind(_status_label)), unsafe_allow_html=True)
         with c2:
             st.markdown(f"**{row['quote_no']}**")
             st.caption(f"픽업 {row['pickup_date']}")
@@ -2449,6 +2510,331 @@ def apply_supply_price_updates(preview_df):
     return updated
 
 
+
+def normalize_price_match_name(value):
+    """상품명 매칭용 정규화.
+
+    DB 상품명 예: 'P.B - 콘솔 15'
+    엑셀 상품명 예: '콘솔 15'
+    둘을 같은 상품으로 보기 위해 접두어/기호/공백을 제거한다.
+    """
+    text = clean_text(value).lower()
+    if not text:
+        return ""
+    text = re.sub(r"p\s*\.?\s*b\s*[-–—_]*", "", text, flags=re.I)
+    text = text.replace("프라비", "")
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"[^0-9a-z가-힣]+", "", text)
+    return text.strip()
+
+
+def is_valid_excel_price_name(value):
+    text = clean_text(value)
+    if not text:
+        return False
+    # 숫자만 있는 값, 가격/수량/사이즈처럼 보이는 값은 상품명에서 제외한다.
+    compact = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"[0-9.,]+", compact):
+        return False
+    if re.fullmatch(r"[0-9.,]+[xX×][0-9.,xX×]+", compact):
+        return False
+    if not re.search(r"[가-힣A-Za-z]", text):
+        return False
+    return True
+
+
+def detect_excel_price_columns(df):
+    """엑셀 추출 CSV의 상품명/가격 컬럼을 찾는다."""
+    cols = [str(c) for c in df.columns]
+    name_candidates = [
+        "product_name_excel", "상품명", "product_name", "name", "이름", "품명", "제품명"
+    ]
+    price_candidates = [
+        "price", "가격", "렌탈가", "대여가", "단가", "공급가", "rental_price"
+    ]
+    name_col = next((c for c in name_candidates if c in cols), None)
+    price_col = next((c for c in price_candidates if c in cols), None)
+    if not name_col or not price_col:
+        raise ValueError(
+            "CSV에서 상품명/가격 컬럼을 찾지 못했습니다. "
+            "필요 컬럼 예: product_name_excel, price"
+        )
+    return name_col, price_col
+
+
+def prepare_excel_name_price_import(uploaded_file):
+    """엑셀에서 추출한 상품명/가격 CSV를 products 테이블과 상품명 기준으로 매칭한다."""
+    source_df, encoding = read_cafe24_csv(uploaded_file)
+    name_col, price_col = detect_excel_price_columns(source_df)
+
+    work = pd.DataFrame({
+        "source_row": range(2, len(source_df) + 2),
+        "excel_product_name": source_df[name_col].astype(str).map(clean_text),
+        "raw_price": source_df[price_col].astype(str).map(clean_text),
+    })
+    if "sheet" in source_df.columns:
+        work["sheet"] = source_df["sheet"].astype(str).map(clean_text)
+    else:
+        work["sheet"] = ""
+    if "excel_row" in source_df.columns:
+        work["excel_row"] = source_df["excel_row"].astype(str).map(clean_text)
+    else:
+        work["excel_row"] = work["source_row"].astype(str)
+
+    work["new_price"] = work["raw_price"].map(parse_supply_price_value)
+    work["normalized_name"] = work["excel_product_name"].map(normalize_price_match_name)
+    work["valid_name"] = work["excel_product_name"].map(is_valid_excel_price_name)
+
+    invalid_name_count = int((~work["valid_name"]).sum())
+    zero_skipped_count = int((work["new_price"] <= 0).sum())
+
+    valid = work[(work["valid_name"]) & (work["new_price"] > 0) & (work["normalized_name"] != "")].copy()
+
+    # CSV 안에서 같은 상품명이 여러 가격을 가지면 자동 반영하지 않는다.
+    csv_records = []
+    duplicate_price_names = set()
+    for norm, g in valid.groupby("normalized_name", dropna=False):
+        prices = sorted(set(int(x) for x in g["new_price"].dropna().astype(int).tolist()))
+        names = sorted(set(str(x) for x in g["excel_product_name"].dropna().tolist()))
+        sheets = ", ".join(sorted(set(str(x) for x in g["sheet"].dropna().tolist()))[:5])
+        rows = ", ".join(sorted(set(str(x) for x in g["excel_row"].dropna().tolist()))[:8])
+        if len(prices) > 1:
+            duplicate_price_names.add(norm)
+            csv_records.append({
+                "normalized_name": norm,
+                "excel_product_name": names[0] if names else "",
+                "new_price": prices[-1],
+                "excel_prices": ", ".join(str(p) for p in prices),
+                "sheet": sheets,
+                "excel_row": rows,
+                "csv_duplicate_price": True,
+            })
+        else:
+            csv_records.append({
+                "normalized_name": norm,
+                "excel_product_name": names[0] if names else "",
+                "new_price": prices[0] if prices else 0,
+                "excel_prices": str(prices[0]) if prices else "",
+                "sheet": sheets,
+                "excel_row": rows,
+                "csv_duplicate_price": False,
+            })
+
+    csv_df = pd.DataFrame(csv_records)
+    if csv_df.empty:
+        csv_df = pd.DataFrame(columns=[
+            "normalized_name", "excel_product_name", "new_price", "excel_prices",
+            "sheet", "excel_row", "csv_duplicate_price"
+        ])
+
+    db_rows = table_all("products", select="product_no,name,price")
+    db_df = df_from_rows(db_rows, ["product_no", "name", "price"])
+    if db_df.empty:
+        db_df = pd.DataFrame(columns=["normalized_name", "product_no", "db_product_name", "current_price", "db_duplicate"])
+    else:
+        db_df["product_no"] = db_df["product_no"].astype(str).str.strip()
+        db_df["db_product_name"] = db_df["name"].fillna("").astype(str)
+        db_df["normalized_name"] = db_df["db_product_name"].map(normalize_price_match_name)
+        db_df["current_price"] = db_df["price"].map(lambda v: safe_int(v, 0))
+        db_dup_map = db_df.groupby("normalized_name")["product_no"].transform("count") > 1
+        db_df["db_duplicate"] = db_dup_map
+        db_df = db_df[["normalized_name", "product_no", "db_product_name", "current_price", "db_duplicate"]]
+
+    preview = csv_df.merge(db_df, on="normalized_name", how="left")
+    for c in ["product_no", "db_product_name"]:
+        if c not in preview.columns:
+            preview[c] = ""
+    if "current_price" not in preview.columns:
+        preview["current_price"] = 0
+    if "db_duplicate" not in preview.columns:
+        preview["db_duplicate"] = False
+
+    preview["db_exists"] = preview["product_no"].fillna("").astype(str).str.strip() != ""
+    preview["current_price"] = preview["current_price"].map(lambda v: safe_int(v, 0))
+    preview["db_duplicate"] = preview["db_duplicate"].fillna(False).astype(bool)
+    preview["csv_duplicate_price"] = preview["csv_duplicate_price"].fillna(False).astype(bool)
+    preview["changed"] = (
+        preview["db_exists"]
+        & (~preview["db_duplicate"])
+        & (~preview["csv_duplicate_price"])
+        & (preview["current_price"] != preview["new_price"])
+    )
+
+    def row_status(row):
+        if row["csv_duplicate_price"]:
+            return "CSV 중복가격 확인필요"
+        if not row["db_exists"]:
+            return "DB 미매칭"
+        if row["db_duplicate"]:
+            return "DB 중복 확인필요"
+        if row["changed"]:
+            return "변경 예정"
+        return "동일"
+
+    preview["status"] = preview.apply(row_status, axis=1)
+    status_rank = {
+        "변경 예정": 0,
+        "CSV 중복가격 확인필요": 1,
+        "DB 중복 확인필요": 2,
+        "DB 미매칭": 3,
+        "동일": 4,
+    }
+    preview["__rank"] = preview["status"].map(status_rank).fillna(9)
+    preview = preview.sort_values(["__rank", "normalized_name", "product_no"]).drop(columns=["__rank"]).reset_index(drop=True)
+
+    return {
+        "encoding": encoding,
+        "source_count": int(len(source_df)),
+        "valid_count": int(len(valid)),
+        "unique_name_count": int(csv_df["normalized_name"].nunique()) if not csv_df.empty else 0,
+        "invalid_name_count": invalid_name_count,
+        "zero_skipped_count": zero_skipped_count,
+        "matched_count": int(preview["db_exists"].sum()) if not preview.empty else 0,
+        "unmatched_count": int((~preview["db_exists"]).sum()) if not preview.empty else 0,
+        "changed_count": int(preview["changed"].sum()) if not preview.empty else 0,
+        "same_count": int((preview["status"] == "동일").sum()) if not preview.empty else 0,
+        "csv_duplicate_count": int((preview["status"] == "CSV 중복가격 확인필요").sum()) if not preview.empty else 0,
+        "db_duplicate_count": int((preview["status"] == "DB 중복 확인필요").sum()) if not preview.empty else 0,
+        "preview": preview,
+    }
+
+
+def apply_excel_name_price_updates(preview_df):
+    """상품명 매칭 미리보기 중 변경 예정 행만 products.price에 반영한다."""
+    changes = preview_df[preview_df["changed"]].copy()
+    if changes.empty:
+        return 0
+
+    rows = []
+    seen = set()
+    for _, row in changes.iterrows():
+        pno = str(row.get("product_no", "")).strip()
+        if not pno or pno in seen:
+            continue
+        seen.add(pno)
+        rows.append({"product_no": pno, "price": int(row["new_price"])})
+
+    client = supabase_client()
+    updated = 0
+    for batch in chunked(rows, 300):
+        client.table("products").upsert(batch, on_conflict="product_no").execute()
+        updated += len(batch)
+
+    set_meta("last_excel_name_price_import_at", now_text())
+    clear_data_cache()
+    return updated
+
+
+def render_excel_name_price_import_panel():
+    st.write("엑셀에서 추출한 **상품명/가격 CSV**를 업로드해서, DB에 이미 있는 상품명만 기본 단가로 반영합니다.")
+    st.caption("상품명 기준 매칭입니다. DB에 없는 상품은 새로 만들지 않고, 중복 상품명/중복 가격은 자동 반영하지 않습니다.")
+
+    flash = st.session_state.pop("excel_name_price_import_flash", "")
+    if flash:
+        st.success(flash)
+
+    uploaded = st.file_uploader(
+        "엑셀 추출 가격 CSV 업로드",
+        type=["csv"],
+        key="excel_name_price_csv_upload",
+        help="예: pravi_excel_prices_extracted_no_numeric.csv",
+    )
+    if uploaded is None:
+        st.info("CSV를 선택하면 DB 상품명과 비교한 뒤, 실제 반영 전에 변경 목록을 보여줍니다.")
+        return
+
+    try:
+        result = prepare_excel_name_price_import(uploaded)
+    except Exception as e:
+        st.error(f"CSV 확인 실패: {e}")
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("CSV 전체", f"{result['source_count']:,}개")
+    m2.metric("상품명 유효", f"{result['valid_count']:,}개")
+    m3.metric("DB 매칭", f"{result['matched_count']:,}개")
+    m4.metric("변경 예정", f"{result['changed_count']:,}개")
+
+    st.caption(
+        f"인코딩: {result['encoding']} · 0원/빈가격 제외 {result['zero_skipped_count']:,}개 · "
+        f"숫자만/빈 상품명 제외 {result['invalid_name_count']:,}개 · "
+        f"DB 미매칭 {result['unmatched_count']:,}개 · 동일 {result['same_count']:,}개"
+    )
+    if result["csv_duplicate_count"]:
+        st.warning(f"CSV 안에서 같은 상품명에 가격이 여러 개인 항목 {result['csv_duplicate_count']:,}개는 자동 반영하지 않습니다.")
+    if result["db_duplicate_count"]:
+        st.warning(f"DB에 같은 이름으로 중복 매칭된 항목 {result['db_duplicate_count']:,}개는 자동 반영하지 않습니다.")
+
+    preview = result["preview"]
+    if preview.empty:
+        st.warning("반영할 수 있는 가격 데이터가 없습니다.")
+        return
+
+    view = preview[[
+        "status", "excel_product_name", "db_product_name", "product_no",
+        "current_price", "new_price", "sheet", "excel_row", "excel_prices"
+    ]].copy()
+    view.columns = ["상태", "엑셀 상품명", "DB 상품명", "상품번호", "현재 단가", "새 단가", "시트", "엑셀 행", "엑셀 가격들"]
+
+    st.markdown("#### 반영 미리보기")
+    st.dataframe(view.head(500), use_container_width=True, hide_index=True, height=360)
+    if len(view) > 500:
+        st.caption("화면에는 앞 500개만 표시합니다. 아래 CSV 다운로드에는 전체 결과가 포함됩니다.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "전체 비교표 다운로드",
+            data=view.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"pravi_excel_name_price_preview_{today_yyyymmdd()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_excel_name_price_preview",
+        )
+    with c2:
+        changed_backup = view[view["상태"] == "변경 예정"].copy()
+        st.download_button(
+            "반영 전 가격 백업 다운로드",
+            data=changed_backup.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"pravi_excel_name_price_backup_{today_yyyymmdd()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_excel_name_price_backup",
+        )
+
+    for status in ["CSV 중복가격 확인필요", "DB 중복 확인필요", "DB 미매칭"]:
+        sub = view[view["상태"] == status]
+        if not sub.empty:
+            with st.expander(f"{status} {len(sub):,}개 보기"):
+                st.dataframe(sub, use_container_width=True, hide_index=True, height=260)
+
+    if result["changed_count"] <= 0:
+        st.info("현재 DB와 가격이 같거나, 자동 반영 가능한 항목이 없습니다.")
+        return
+
+    confirmed = st.checkbox(
+        f"변경 예정 {result['changed_count']:,}개의 단가를 products.price에 반영합니다.",
+        key="confirm_excel_name_price_import",
+    )
+    if st.button(
+        "엑셀 가격 DB 반영 실행",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirmed,
+        key="apply_excel_name_price_import",
+    ):
+        try:
+            with st.spinner("엑셀 가격을 DB에 반영하는 중입니다..."):
+                updated = apply_excel_name_price_updates(preview)
+            st.session_state["selected_quote_items"] = {}
+            st.session_state["excel_name_price_import_flash"] = (
+                f"완료: {updated:,}개 상품의 기본 단가를 업데이트했습니다. 새 견적부터 이 단가가 자동 입력됩니다."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"DB 반영 실패: {e}")
+
 def render_supply_price_import_panel():
     st.write("Cafe24 상품 CSV의 **공급가가 0원보다 큰 상품만** 프로그램 DB의 기본 단가로 반영합니다.")
     st.caption("0원 상품은 기존 DB 가격을 유지하며, DB에 없는 상품은 새로 만들지 않습니다. 기존 견적서 금액도 변경하지 않습니다.")
@@ -2562,7 +2948,7 @@ def render_supply_price_import_panel():
 
 
 def render_sync_panel():
-    sync_tab, price_tab = st.tabs(["사이트 상품 동기화", "공급가 CSV 반영"])
+    sync_tab, price_tab, excel_price_tab = st.tabs(["사이트 상품 동기화", "Cafe24 공급가 CSV", "엑셀 가격 CSV"])
 
     with sync_tab:
         st.write("사이트 카테고리 URL을 입력하고 상품을 프로그램 DB로 가져옵니다.")
@@ -2603,6 +2989,9 @@ def render_sync_panel():
 
     with price_tab:
         render_supply_price_import_panel()
+
+    with excel_price_tab:
+        render_excel_name_price_import_panel()
 
     if st.button("닫기", key="sync_dialog_close"):
         st.session_state["sync_dialog_open"] = False
@@ -2679,6 +3068,7 @@ def render_holiday_calendar_panel():
     with c2:
         if st.button("닫기", use_container_width=True, key="holiday_close"):
             st.session_state["holiday_dialog_open"] = False
+            st.session_state["scroll_to_top"] = True
             st.rerun()
 
 
@@ -3163,11 +3553,9 @@ def render_quote_detail(quote_id, allow_edit=True, key_prefix="detail", mode="co
     # 수정이 발생하면 자동으로 견적중 상태로 되돌린다.
     composition_editable = status != "삭제"
 
-    title_cols = st.columns([4, 2])
+    title_cols = st.columns([4.2, 1.8])
     with title_cols[0]:
-        st.markdown(f"### {quote['quote_no']} / {quote['team_name']}")
-        st.caption(f"상태: {status} / 대여일: {quote['pickup_date']} ~ {quote['return_date']} / 총액: {money(quote['total'])}")
-        st.caption(pricing_summary_text(quote["pickup_date"], quote["return_date"]))
+        render_quote_detail_header(quote)
     with title_cols[1]:
         top_buttons = st.columns(2)
         with top_buttons[0]:
@@ -3350,8 +3738,10 @@ def combined_quote_list_card(row, key_prefix="combined"):
             show_thumb_from_values(thumb_path, thumb_url) if (thumb_path or thumb_url) else st.caption("이미지 없음")
         with c1:
             st.markdown(f"### {row['team_name']}")
-            st.caption(str(row.get("created_at", "")))
-            st.markdown(status_badge(str(row['status']), status_kind(row['status'])), unsafe_allow_html=True)
+            st.caption(format_datetime_short(row.get("created_at", "")))
+            _status_label = valid_status_text(row.get("status"))
+            if _status_label:
+                st.markdown(status_badge(_status_label, status_kind(_status_label)), unsafe_allow_html=True)
         with c2:
             st.markdown(f"**{row['quote_no']}**")
             st.caption(f"픽업 {row['pickup_date']}")
@@ -3455,7 +3845,7 @@ def page_quote_history():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "tabs-nav-v1"
+APP_BUILD = "excel-name-price-v1"
 require_app_password()
 
 st.markdown("""
@@ -3563,6 +3953,47 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.selected-card-marker) {
     box-shadow:0 0 0 1px rgba(26,115,232,.10), 0 10px 28px rgba(26,115,232,.12) !important;
 }
 div[data-testid="stVerticalBlockBorderWrapper"] {border-radius:22px !important;}
+
+.quote-detail-head {
+    padding: 4px 0 14px 0;
+}
+.quote-status-line {
+    margin-bottom: 10px;
+}
+.quote-title-line {
+    font-size: 30px;
+    font-weight: 900;
+    line-height: 1.25;
+    letter-spacing: -0.8px;
+    color: #242633;
+    word-break: keep-all;
+}
+.quote-meta-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    margin-top: 10px;
+    color: #667085;
+    font-size: 14px;
+}
+.quote-meta-grid span {
+    margin-right: 6px;
+    color: #8A8F98;
+}
+.quote-meta-grid strong {
+    color: #535862;
+    font-weight: 750;
+}
+.quote-pricing-line {
+    display: inline-flex;
+    margin-top: 14px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: #F3F4F6;
+    color: #667085;
+    font-size: 14px;
+    font-weight: 650;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -3592,6 +4023,7 @@ for opt in menu_options:
             st.rerun()
 
 menu = st.session_state["menu"]
+scroll_to_top_once()
 st.sidebar.markdown("<div class='sidebar-nav-spacer'></div>", unsafe_allow_html=True)
 
 st.sidebar.divider()
