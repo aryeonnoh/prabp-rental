@@ -19,6 +19,25 @@ from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client
 
+# OCR 기능은 배포 환경에 패키지가 없을 때도 앱 전체가 죽지 않도록 optional import로 처리
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
+
+try:
+    from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+except Exception:
+    rf_process = None
+    rf_fuzz = None
+
 
 DB_PATH = "rental.db"  # 로컬 백업용 이름. Supabase 버전에서는 직접 사용하지 않음
 THUMB_DIR = "thumbnails"
@@ -3361,6 +3380,246 @@ def add_to_current_selection(row):
         }
 
 
+
+# -----------------------------
+# 이미지 OCR 견적 불러오기
+# -----------------------------
+
+def ocr_clean_line(line):
+    return clean_text(str(line or "").replace("｜", "|").replace("—", "-").replace("–", "-"))
+
+
+def ocr_normalize_product_name(name):
+    """OCR/DB 상품명을 비교하기 위한 정규화."""
+    text = str(name or "").lower()
+    text = text.replace("p.b", "").replace("p b", "").replace("pb", "")
+    text = text.replace("p. b", "").replace("p . b", "")
+    text = text.replace("０", "0").replace("Ｏ", "0").replace("o", "0")
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"[^0-9a-z가-힣]+", "", text)
+    return text.strip()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_ocr_product_candidates():
+    rows = table_all("products", select="product_no,name,size_text,qty,price,thumbnail_url,local_thumbnail_path")
+    candidates = []
+    for r in rows:
+        name = str(r.get("name", "") or "").strip()
+        if not name:
+            continue
+        norm = ocr_normalize_product_name(name)
+        if not norm:
+            continue
+        candidates.append({"product_no": str(r.get("product_no", "")), "name": name, "norm": norm, "row": r})
+    return candidates
+
+
+def preprocess_image_for_ocr(image_bytes):
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    max_w = 2200
+    if img.width > max_w:
+        ratio = max_w / img.width
+        img = img.resize((max_w, int(img.height * ratio)))
+    if cv2 is None or np is None:
+        return img
+    arr = np.array(img)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return Image.fromarray(th)
+
+
+def run_ocr_from_image_bytes(image_bytes):
+    if pytesseract is None:
+        raise RuntimeError("pytesseract 패키지가 설치되어 있지 않습니다. requirements.txt와 packages.txt를 배포에 반영해 주세요.")
+    img = preprocess_image_for_ocr(image_bytes)
+    texts = []
+    for config in ["--oem 3 --psm 6", "--oem 3 --psm 11"]:
+        try:
+            texts.append(pytesseract.image_to_string(img, lang="kor+eng", config=config))
+        except Exception:
+            texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
+    return "\n".join(t for t in texts if t)
+
+
+def parse_ocr_dates(text, base_year=None, base_month=None):
+    base_year = int(base_year or datetime.now().year)
+    base_month = int(base_month or datetime.now().month)
+    t = clean_text(text)
+    m = re.search(r"(\d{1,2})\s*[/\.\-]\s*(\d{1,2})\s*(?:픽업)?\s*[-~]\s*(\d{1,2})\s*[/\.\-]\s*(\d{1,2})\s*(?:반납)?", t)
+    if m:
+        pm, pd, rm, rd = map(int, m.groups())
+        return f"{base_year:04d}-{pm:02d}-{pd:02d}", f"{base_year:04d}-{rm:02d}-{rd:02d}"
+    m = re.search(r"픽\s*업\s*(\d{1,2})\s*일?\s*[-~]\s*반\s*납\s*(\d{1,2})\s*일?", t)
+    if m:
+        pd, rd = map(int, m.groups())
+        return f"{base_year:04d}-{base_month:02d}-{pd:02d}", f"{base_year:04d}-{base_month:02d}-{rd:02d}"
+    m = re.search(r"픽\s*업\s*(\d{1,2})\s*[/\.\-]\s*(\d{1,2}).*?반\s*납\s*(\d{1,2})\s*[/\.\-]\s*(\d{1,2})", t)
+    if m:
+        pm, pd, rm, rd = map(int, m.groups())
+        return f"{base_year:04d}-{pm:02d}-{pd:02d}", f"{base_year:04d}-{rm:02d}-{rd:02d}"
+    return "", ""
+
+
+def parse_ocr_product_lines(text):
+    raw_lines = [ocr_clean_line(x) for x in str(text or "").splitlines()]
+    lines = [x for x in raw_lines if x]
+    found = []
+    seen = set()
+    for line in lines:
+        matched_any = False
+        for m in re.finditer(r"P\s*\.?\s*B\s*[-_－–—]?\s*([가-힣A-Za-z0-9\s/().+\-]{2,35})", line, re.IGNORECASE):
+            name_tail = clean_text(m.group(1))
+            name_tail = re.sub(r"\s{2,}.*$", "", name_tail).strip()
+            name_tail = re.sub(r"(?:w|W)\s*\d+.*$", "", name_tail).strip()
+            if not name_tail:
+                continue
+            product_name = "P.B - " + name_tail
+            key = ocr_normalize_product_name(product_name)
+            if key and key not in seen:
+                seen.add(key)
+                found.append({"ocr_name": product_name, "quantity": 1, "source_line": line})
+            matched_any = True
+        if matched_any:
+            continue
+        if re.search(r"[가-힣]", line) and re.search(r"\d", line):
+            if len(line) <= 28 and not any(x in line for x in ["픽업", "반납", "견적", "프라비", "총금액", "공급", "세액"]):
+                cleaned = re.sub(r"^\d+(?:\.\d+)?\s*", "", line).strip()
+                cleaned = re.sub(r"(?:w|W)\s*\d+.*$", "", cleaned).strip()
+                key = ocr_normalize_product_name(cleaned)
+                if key and key not in seen:
+                    seen.add(key)
+                    found.append({"ocr_name": cleaned, "quantity": 1, "source_line": line})
+    return found
+
+
+def match_ocr_products(candidates):
+    db_candidates = load_ocr_product_candidates()
+    exact = {c["norm"]: c for c in db_candidates}
+    choices = {c["norm"]: c for c in db_candidates}
+    results = []
+    for item in candidates:
+        ocr_name = item.get("ocr_name", "")
+        norm = ocr_normalize_product_name(ocr_name)
+        matched = None
+        score = 0
+        status = "매칭 실패"
+        if norm in exact:
+            matched = exact[norm]
+            score = 100
+            status = "매칭 완료"
+        elif rf_process is not None and choices:
+            best = rf_process.extractOne(norm, list(choices.keys()), scorer=rf_fuzz.WRatio)
+            if best:
+                best_key, score, _ = best
+                if score >= 78:
+                    matched = choices[best_key]
+                    status = "후보 매칭"
+        result = dict(item)
+        result.update({
+            "status": status,
+            "score": int(score or 0),
+            "product_no": matched["product_no"] if matched else "",
+            "product_name": matched["name"] if matched else "",
+            "product_row": matched["row"] if matched else {},
+        })
+        results.append(result)
+    return results
+
+
+def render_ocr_import_panel(current_pickup="", current_return=""):
+    with st.expander("이미지로 상품 불러오기", expanded=False):
+        st.caption("이미지 안의 날짜와 상품명을 OCR로 읽은 뒤, 확인한 항목만 선택 목록에 추가합니다.")
+        uploaded = st.file_uploader("상품 선택 이미지 업로드", type=["png", "jpg", "jpeg", "webp"], key="ocr_quote_image_upload")
+        base_year = datetime.now().year
+        base_month = datetime.now().month
+        try:
+            if current_pickup:
+                dt = parse_date_text(current_pickup)
+                base_year, base_month = dt.year, dt.month
+        except Exception:
+            pass
+        c1, c2 = st.columns(2)
+        with c1:
+            base_year = st.number_input("월 정보가 없는 이미지의 기준 연도", min_value=2020, max_value=2035, value=base_year, step=1, key="ocr_base_year")
+        with c2:
+            base_month = st.number_input("월 정보가 없는 이미지의 기준 월", min_value=1, max_value=12, value=base_month, key="ocr_base_month")
+        if uploaded is not None and st.button("OCR 실행", type="primary", key="run_ocr_import"):
+            try:
+                with st.spinner("이미지에서 글자를 읽는 중입니다..."):
+                    raw_text = run_ocr_from_image_bytes(uploaded.getvalue())
+                    pickup_s, return_s = parse_ocr_dates(raw_text, base_year=base_year, base_month=base_month)
+                    products = parse_ocr_product_lines(raw_text)
+                    matches = match_ocr_products(products)
+                    st.session_state["ocr_import_result"] = {"raw_text": raw_text, "pickup_date": pickup_s, "return_date": return_s, "matches": matches}
+            except Exception as e:
+                st.error(f"OCR 실행 실패: {e}")
+        result = st.session_state.get("ocr_import_result")
+        if not result:
+            return
+        st.markdown("#### 인식 결과")
+        d1, d2 = st.columns(2)
+        with d1:
+            detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key="ocr_detected_pickup")
+        with d2:
+            detected_return = st.text_input("인식된 반납일", value=result.get("return_date", ""), key="ocr_detected_return")
+        rows = []
+        for m in result.get("matches", []):
+            rows.append({
+                "선택": bool(m.get("product_no")),
+                "상태": m.get("status", ""),
+                "OCR 상품명": m.get("ocr_name", ""),
+                "매칭 상품명": m.get("product_name", ""),
+                "상품번호": m.get("product_no", ""),
+                "수량": int(max(1, safe_int(m.get("quantity", 1), 1))),
+                "유사도": m.get("score", 0),
+            })
+        if rows:
+            edited = st.data_editor(
+                pd.DataFrame(rows),
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                column_config={
+                    "선택": st.column_config.CheckboxColumn("선택"),
+                    "수량": st.column_config.NumberColumn("수량", min_value=1, step=1),
+                },
+                key="ocr_import_editor",
+            )
+            col_add, col_text = st.columns([1, 1])
+            with col_add:
+                if st.button("선택 상품에 추가", type="primary", use_container_width=True, key="ocr_add_to_quote"):
+                    added = 0
+                    for _, r in edited.iterrows():
+                        if not bool(r.get("선택")) or not str(r.get("상품번호", "")).strip():
+                            continue
+                        p = get_product(str(r.get("상품번호")))
+                        if not p:
+                            continue
+                        add_to_current_selection(p)
+                        pno = str(p.get("product_no"))
+                        qty = max(1, safe_int(r.get("수량", 1), 1))
+                        stock_qty = max(1, safe_int(p.get("qty", 1), 1))
+                        if qty > stock_qty:
+                            qty = stock_qty
+                        st.session_state["selected_quote_items"][pno]["quantity"] = qty
+                        added += 1
+                    if detected_pickup:
+                        st.session_state["create_pickup_text"] = detected_pickup
+                    if detected_return:
+                        st.session_state["create_return_text"] = detected_return
+                    st.success(f"{added}개 상품을 선택 목록에 추가했습니다.")
+                    st.rerun()
+            with col_text:
+                with st.expander("OCR 원문 보기"):
+                    st.text(result.get("raw_text", ""))
+        else:
+            st.warning("이미지에서 상품명을 찾지 못했습니다. OCR 원문을 확인해 주세요.")
+            with st.expander("OCR 원문 보기", expanded=True):
+                st.text(result.get("raw_text", ""))
+
 def page_quote_create():
     init_current_quote_state()
     st.header("견적서 만들기")
@@ -4487,6 +4746,9 @@ def page_quote_create():
         st.warning(date_error)
     elif pickup_date and return_date:
         st.caption(pricing_summary_text(pickup_date, return_date))
+
+    render_ocr_import_panel(pickup_date or "", return_date or "")
+
     search = st.text_input("상품 검색", key="create_product_search", placeholder="상품명 입력")
     st.subheader("상품 선택")
     try:
@@ -4620,7 +4882,7 @@ def page_quote_create():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "excel-name-price-v1"
+APP_BUILD = "ocr-import-v1"
 require_app_password()
 
 st.markdown("""
