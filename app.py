@@ -3415,23 +3415,56 @@ def load_ocr_product_candidates():
     return candidates
 
 
-def preprocess_image_for_ocr(image_bytes):
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    max_w = 2200
+def _pil_resize_for_ocr(img, max_w=2400):
+    img = img.convert("RGB")
     if img.width > max_w:
         ratio = max_w / img.width
-        img = img.resize((max_w, int(img.height * ratio)))
+        img = img.resize((max_w, int(img.height * ratio)), Image.Resampling.LANCZOS)
+    return img
+
+
+def preprocess_image_for_ocr(image_bytes):
+    """전체 이미지 OCR용 전처리. 날짜 인식에 사용한다."""
+    img = _pil_resize_for_ocr(Image.open(BytesIO(image_bytes)), max_w=2400)
     if cv2 is None or np is None:
         return img
     arr = np.array(img)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    gray = cv2.resize(gray, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.resize(gray, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.convertScaleAbs(gray, alpha=1.35, beta=6)
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return Image.fromarray(th)
 
 
+def preprocess_crop_for_ocr(pil_img, scale=4.0):
+    """상품 카드 하단 텍스트 OCR용 전처리."""
+    img = pil_img.convert("RGB")
+    if cv2 is None or np is None:
+        return img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
+    arr = np.array(img)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # 작은 글자를 살리기 위해 배경 노이즈를 줄이고 대비를 올린다.
+    gray = cv2.bilateralFilter(gray, 5, 55, 55)
+    gray = cv2.convertScaleAbs(gray, alpha=1.55, beta=8)
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    except Exception:
+        pass
+    # 너무 강한 threshold는 한글 획을 날릴 수 있어서 adaptive + otsu 중 더 글자가 많은 쪽을 사용한다.
+    th1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
+    _, th2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 검은 픽셀 수가 너무 적으면 adaptive, 아니면 otsu
+    black1 = int((th1 < 128).sum())
+    black2 = int((th2 < 128).sum())
+    th = th1 if black1 > black2 * 1.25 else th2
+    return Image.fromarray(th)
+
+
 def run_ocr_from_image_bytes(image_bytes):
+    """전체 이미지 OCR. 날짜와 보조 텍스트 인식용."""
     if pytesseract is None:
         raise RuntimeError("pytesseract 패키지가 설치되어 있지 않습니다. requirements.txt와 packages.txt를 배포에 반영해 주세요.")
     img = preprocess_image_for_ocr(image_bytes)
@@ -3442,6 +3475,138 @@ def run_ocr_from_image_bytes(image_bytes):
         except Exception:
             texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
     return "\n".join(t for t in texts if t)
+
+
+def _merge_boxes(boxes, iou_threshold=0.22):
+    """비슷한 카드 박스를 병합한다."""
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    kept = []
+    for x, y, w, h in boxes:
+        area = w * h
+        duplicate = False
+        for kx, ky, kw, kh in kept:
+            ix1, iy1 = max(x, kx), max(y, ky)
+            ix2, iy2 = min(x + w, kx + kw), min(y + h, ky + kh)
+            iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+            inter = iw * ih
+            union = area + kw * kh - inter
+            if union and inter / union > iou_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append((x, y, w, h))
+    # 위에서 아래, 왼쪽에서 오른쪽
+    kept = sorted(kept, key=lambda b: (round(b[1] / 40) * 40, b[0]))
+    return kept
+
+
+def detect_product_card_boxes(image_bytes):
+    """상품 카드 영역 감지.
+
+    1차: 노란 테두리/밝은 카드 테두리 감지
+    2차: 연한 배경 위의 큰 흰색/회색 상품 카드 영역 감지
+    """
+    if cv2 is None or np is None:
+        return []
+    pil = _pil_resize_for_ocr(Image.open(BytesIO(image_bytes)), max_w=2400)
+    arr = np.array(pil)
+    h_img, w_img = arr.shape[:2]
+    boxes = []
+
+    # 1) 노란 테두리 카드 감지: 카톡 이미지 예시처럼 상품 카드 테두리가 노란색일 때
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    yellow = cv2.inRange(hsv, np.array([18, 60, 120]), np.array([45, 255, 255]))
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+    contours, _ = cv2.findContours(yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 90 or h < 110:
+            continue
+        if w * h < 16000:
+            continue
+        if w > w_img * 0.95 or h > h_img * 0.95:
+            continue
+        # 테두리만 잡힐 수 있으므로 약간 확장
+        pad = 8
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(w_img, x + w + pad)
+        y1 = min(h_img, y + h + pad)
+        boxes.append((x0, y0, x1 - x0, y1 - y0))
+
+    # 2) 밝은 사각 카드 감지: 노란 테두리가 없는 경우 보조
+    if len(boxes) < 3:
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        # 배경과 카드 구분을 위해 가장자리 검출 후 닫기 연산
+        edges = cv2.Canny(gray, 40, 120)
+        edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            if w < 90 or h < 110 or area < 18000:
+                continue
+            if w > w_img * 0.45 or h > h_img * 0.75:
+                continue
+            ratio = w / max(h, 1)
+            if not (0.35 <= ratio <= 1.8):
+                continue
+            boxes.append((x, y, w, h))
+
+    boxes = _merge_boxes(boxes)
+    # 지나치게 큰 박스나 화면 헤더를 제거
+    filtered = []
+    for x, y, w, h in boxes:
+        if y < h_img * 0.04 and h < h_img * 0.18:
+            continue
+        if w * h > w_img * h_img * 0.35:
+            continue
+        filtered.append((x, y, w, h))
+    return filtered[:60]
+
+
+def _ocr_pil_image(pil_img, config="--oem 3 --psm 6"):
+    try:
+        return pytesseract.image_to_string(pil_img, lang="kor+eng", config=config)
+    except Exception:
+        return pytesseract.image_to_string(pil_img, lang="eng", config=config)
+
+
+def run_card_ocr_from_image_bytes(image_bytes):
+    """상품 카드별 OCR.
+
+    전체 이미지를 통째로 읽는 대신, 카드 영역을 먼저 찾은 뒤 상품명/사이즈가 있는 하단부를
+    크게 확대해서 읽는다. OCR 결과에는 카드 번호를 붙여 디버깅이 가능하게 한다.
+    """
+    if pytesseract is None:
+        raise RuntimeError("pytesseract 패키지가 설치되어 있지 않습니다.")
+    pil = _pil_resize_for_ocr(Image.open(BytesIO(image_bytes)), max_w=2400)
+    boxes = detect_product_card_boxes(image_bytes)
+    texts = []
+    for idx, (x, y, w, h) in enumerate(boxes, start=1):
+        card = pil.crop((x, y, x + w, y + h))
+        # 상품명은 보통 카드 하단 35~45%에 있음. 수량은 상단에 있을 수 있어 전체도 조금 읽는다.
+        text_crop = card.crop((0, int(card.height * 0.52), card.width, card.height))
+        crop_img = preprocess_crop_for_ocr(text_crop, scale=4.2)
+        txt1 = _ocr_pil_image(crop_img, config="--oem 3 --psm 6")
+        # 카드 전체 OCR은 보조로만. 너무 느려지지 않도록 작은 수량일 때만 실행.
+        txt2 = ""
+        if len(boxes) <= 25:
+            whole = preprocess_crop_for_ocr(card, scale=2.3)
+            txt2 = _ocr_pil_image(whole, config="--oem 3 --psm 11")
+        block = f"[CARD {idx}]\n{txt1}\n{txt2}"
+        texts.append(block)
+    return "\n".join(texts), len(boxes)
+
+
+def run_ocr_analysis_from_image_bytes(image_bytes):
+    """OCR v2: 날짜는 전체 이미지에서, 상품은 카드별 OCR에서 우선 추출."""
+    full_text = run_ocr_from_image_bytes(image_bytes)
+    card_text, card_count = run_card_ocr_from_image_bytes(image_bytes)
+    combined = f"{full_text}\n\n--- CARD OCR ({card_count}) ---\n{card_text}".strip()
+    return combined, full_text, card_text, card_count
 
 
 def parse_ocr_dates(text, base_year=None, base_month=None):
@@ -3463,60 +3628,149 @@ def parse_ocr_dates(text, base_year=None, base_month=None):
     return "", ""
 
 
+def ocr_extract_quantity_from_line(line):
+    """OCR 라인에서 빨간 수량처럼 보이는 앞쪽 숫자를 가져온다. 실패하면 1."""
+    text = clean_text(line)
+    # 2개, 1.5, 0.8 등. 현재 견적 수량은 정수 기반이라 소수는 올림 처리한다.
+    m = re.match(r"^\s*(\d+(?:[\.,]\d+)?)\s*(?:개|ea|EA)?\b", text)
+    if not m:
+        return 1
+    try:
+        v = float(m.group(1).replace(",", "."))
+        return max(1, int(math.ceil(v)))
+    except Exception:
+        return 1
+
+
+def ocr_candidate_line_is_noise(line):
+    t = clean_text(line)
+    if not t:
+        return True
+    if any(x in t for x in ["픽업", "반납", "견적", "프라비", "총금액", "공급", "세액", "CARD OCR"]):
+        return True
+    if re.fullmatch(r"[0-9\s./,()\-]+", t):
+        return True
+    # 사이즈 라인만 있는 경우 제거
+    if re.search(r"\b[Ww]\s*\d+", t) and not re.search(r"[가-힣]", t.replace("W", "").replace("w", "")):
+        return True
+    if re.search(r"\b[HhDd]\s*\d+", t) and len(t) < 24 and not re.search(r"[가-힣]", t):
+        return True
+    return False
+
+
+def cleanup_ocr_product_tail(text):
+    tail = clean_text(text)
+    tail = tail.replace("—", "-").replace("–", "-").replace("－", "-")
+    # 수량/사이즈/설명 쪽 잘라내기
+    tail = re.sub(r"\s{2,}.*$", "", tail).strip()
+    tail = re.sub(r"(?:[Ww]\s*\d+|[Dd]\s*\d+|[Hh]\s*\d+).*$", "", tail).strip()
+    tail = re.sub(r"(?:사이즈|상세|참고|SET|상품|입니다).*$", "", tail).strip()
+    tail = re.sub(r"^[\-_:·•\s]+", "", tail).strip()
+    tail = re.sub(r"[\|\\]+", "", tail).strip()
+    return tail
+
+
 def parse_ocr_product_lines(text):
     raw_lines = [ocr_clean_line(x) for x in str(text or "").splitlines()]
     lines = [x for x in raw_lines if x]
+    # 상품명이 줄바꿈되어 P.B - / 식기 32처럼 나오는 경우가 있어 인접 라인을 붙여서도 본다.
+    scan_lines = []
+    for i, line in enumerate(lines):
+        scan_lines.append(line)
+        if i + 1 < len(lines):
+            scan_lines.append(line + " " + lines[i + 1])
+        if i + 2 < len(lines):
+            scan_lines.append(line + " " + lines[i + 1] + " " + lines[i + 2])
+
     found = []
     seen = set()
-    for line in lines:
+    for line in scan_lines:
+        if ocr_candidate_line_is_noise(line):
+            continue
+        qty = ocr_extract_quantity_from_line(line)
         matched_any = False
-        for m in re.finditer(r"P\s*\.?\s*B\s*[-_－–—]?\s*([가-힣A-Za-z0-9\s/().+\-]{2,35})", line, re.IGNORECASE):
-            name_tail = clean_text(m.group(1))
-            name_tail = re.sub(r"\s{2,}.*$", "", name_tail).strip()
-            name_tail = re.sub(r"(?:w|W)\s*\d+.*$", "", name_tail).strip()
-            if not name_tail:
+
+        # P.B 표기가 인식된 경우
+        for m in re.finditer(r"P\s*\.?\s*B\s*[-_－–—]?\s*([가-힣A-Za-z0-9\s/().+\-]{1,40})", line, re.IGNORECASE):
+            name_tail = cleanup_ocr_product_tail(m.group(1))
+            if not name_tail or not re.search(r"[가-힣A-Za-z]", name_tail) or not re.search(r"\d", name_tail):
                 continue
             product_name = "P.B - " + name_tail
             key = ocr_normalize_product_name(product_name)
             if key and key not in seen:
                 seen.add(key)
-                found.append({"ocr_name": product_name, "quantity": 1, "source_line": line})
+                found.append({"ocr_name": product_name, "quantity": qty, "source_line": line})
             matched_any = True
         if matched_any:
             continue
+
+        # P.B가 빠진 경우: 식기 32 / 장스탠드 90 같은 형태
         if re.search(r"[가-힣]", line) and re.search(r"\d", line):
-            if len(line) <= 28 and not any(x in line for x in ["픽업", "반납", "견적", "프라비", "총금액", "공급", "세액"]):
-                cleaned = re.sub(r"^\d+(?:\.\d+)?\s*", "", line).strip()
-                cleaned = re.sub(r"(?:w|W)\s*\d+.*$", "", cleaned).strip()
+            if len(line) <= 46:
+                cleaned = re.sub(r"^\d+(?:[\.,]\d+)?\s*(?:개)?\s*", "", line).strip()
+                cleaned = cleanup_ocr_product_tail(cleaned)
+                # 앞뒤에 붙은 OCR 잡음 제거
+                cleaned = re.sub(r"^[^가-힣A-Za-z]+", "", cleaned).strip()
+                if not cleaned or ocr_candidate_line_is_noise(cleaned):
+                    continue
+                if not re.search(r"[가-힣A-Za-z]", cleaned) or not re.search(r"\d", cleaned):
+                    continue
                 key = ocr_normalize_product_name(cleaned)
                 if key and key not in seen:
                     seen.add(key)
-                    found.append({"ocr_name": cleaned, "quantity": 1, "source_line": line})
+                    found.append({"ocr_name": cleaned, "quantity": qty, "source_line": line})
     return found
+
+
+def ocr_trailing_number(name):
+    m = re.search(r"(\d+)\s*(?:\([^)]*\))?\s*$", str(name or ""))
+    return m.group(1) if m else ""
 
 
 def match_ocr_products(candidates):
     db_candidates = load_ocr_product_candidates()
     exact = {c["norm"]: c for c in db_candidates}
     choices = {c["norm"]: c for c in db_candidates}
+
+    by_tail = {}
+    for c in db_candidates:
+        tail = ocr_trailing_number(c.get("name", ""))
+        if tail:
+            by_tail.setdefault(tail, []).append(c)
+
     results = []
     for item in candidates:
         ocr_name = item.get("ocr_name", "")
         norm = ocr_normalize_product_name(ocr_name)
+        tail = ocr_trailing_number(ocr_name)
         matched = None
         score = 0
         status = "매칭 실패"
+
         if norm in exact:
             matched = exact[norm]
             score = 100
             status = "매칭 완료"
-        elif rf_process is not None and choices:
-            best = rf_process.extractOne(norm, list(choices.keys()), scorer=rf_fuzz.WRatio)
-            if best:
-                best_key, score, _ = best
-                if score >= 78:
-                    matched = choices[best_key]
-                    status = "후보 매칭"
+        elif rf_process is not None:
+            # 상품번호 끝 숫자가 같으면 그 후보군 안에서 먼저 찾는다.
+            tail_candidates = by_tail.get(tail, []) if tail else []
+            if tail_candidates:
+                tail_choices = {c["norm"]: c for c in tail_candidates}
+                best = rf_process.extractOne(norm, list(tail_choices.keys()), scorer=rf_fuzz.WRatio)
+                if best:
+                    best_key, score, _ = best
+                    # 끝 번호가 같으면 OCR 글자 일부가 틀려도 후보로 인정
+                    if score >= 52:
+                        matched = tail_choices[best_key]
+                        status = "후보 매칭"
+            if matched is None and choices:
+                best = rf_process.extractOne(norm, list(choices.keys()), scorer=rf_fuzz.WRatio)
+                if best:
+                    best_key, score, _ = best
+                    if score >= 78:
+                        matched = choices[best_key]
+                        status = "후보 매칭"
+
         result = dict(item)
         result.update({
             "status": status,
@@ -3549,17 +3803,27 @@ def render_ocr_import_panel(current_pickup="", current_return=""):
         if uploaded is not None and st.button("OCR 실행", type="primary", key="run_ocr_import"):
             try:
                 with st.spinner("이미지에서 글자를 읽는 중입니다..."):
-                    raw_text = run_ocr_from_image_bytes(uploaded.getvalue())
-                    pickup_s, return_s = parse_ocr_dates(raw_text, base_year=base_year, base_month=base_month)
+                    raw_text, full_text, card_text, card_count = run_ocr_analysis_from_image_bytes(uploaded.getvalue())
+                    pickup_s, return_s = parse_ocr_dates(full_text or raw_text, base_year=base_year, base_month=base_month)
                     products = parse_ocr_product_lines(raw_text)
                     matches = match_ocr_products(products)
-                    st.session_state["ocr_import_result"] = {"raw_text": raw_text, "pickup_date": pickup_s, "return_date": return_s, "matches": matches}
+                    st.session_state["ocr_import_result"] = {
+                        "raw_text": raw_text,
+                        "full_text": full_text,
+                        "card_text": card_text,
+                        "card_count": card_count,
+                        "pickup_date": pickup_s,
+                        "return_date": return_s,
+                        "matches": matches,
+                    }
             except Exception as e:
                 st.error(f"OCR 실행 실패: {e}")
         result = st.session_state.get("ocr_import_result")
         if not result:
             return
         st.markdown("#### 인식 결과")
+        if result.get("card_count") is not None:
+            st.caption(f"감지된 상품 카드: {result.get('card_count', 0)}개 · 카드별 OCR을 우선 사용합니다.")
         d1, d2 = st.columns(2)
         with d1:
             detected_pickup = st.text_input("인식된 픽업일", value=result.get("pickup_date", ""), key="ocr_detected_pickup")
@@ -4882,7 +5146,7 @@ def page_quote_create():
 
 init_db()
 st.set_page_config(page_title="프라비 렌탈 관리", layout="wide")
-APP_BUILD = "ocr-import-v1"
+APP_BUILD = "ocr-import-v2-card-crop"
 require_app_password()
 
 st.markdown("""
