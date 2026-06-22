@@ -3839,6 +3839,781 @@ def page_quote_history():
 
 
 
+
+
+# =============================================================
+# 견적서 가로형 출력 / 연박 10% / D.C / 확정 거래명세서 패치
+# =============================================================
+# 이 블록은 위에서 정의된 기존 함수들을 배포 직전에 다시 정의해서 최신 운영 기준을 적용한다.
+
+import zipfile
+
+
+def parse_quote_meta(value):
+    """quotes.memo를 기존 일반 메모와 신규 JSON 메타 모두 호환해서 읽는다."""
+    text = str(value or "").strip()
+    base = {"note": "", "dc_label": "", "dc_amount": 0}
+    if not text:
+        return base
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            base.update(data)
+            base["dc_amount"] = safe_int(base.get("dc_amount", 0), 0)
+            return base
+    except Exception:
+        pass
+    base["note"] = text
+    return base
+
+
+def build_quote_meta(note="", dc_label="", dc_amount=0):
+    return json.dumps({
+        "note": clean_text(note),
+        "dc_label": clean_text(dc_label),
+        "dc_amount": max(safe_int(dc_amount, 0), 0),
+    }, ensure_ascii=False)
+
+
+def quote_discount_info(quote):
+    meta = parse_quote_meta((quote or {}).get("memo", ""))
+    label = clean_text(meta.get("dc_label", ""))
+    amount = max(safe_int(meta.get("dc_amount", 0), 0), 0)
+    return label, amount
+
+
+def rental_pricing_context(pickup_date, return_date, holidays=None):
+    """상품 단가는 2박 3일 기준 금액이다.
+
+    - 일요일과 지정 휴일은 청구일에서 제외한다.
+    - 기본 2박 3일 = 청구 영업일 3일까지 기본가 1배
+    - 청구 영업일이 3일을 초과하면 초과 1일당 공급가의 10%를 연박으로 계산한다.
+    """
+    pickup_s = normalize_date_text(pickup_date)
+    return_s = normalize_date_text(return_date)
+    start = datetime.strptime(pickup_s, "%Y-%m-%d").date()
+    end = datetime.strptime(return_s, "%Y-%m-%d").date()
+    if end < start:
+        raise ValueError("반납 날짜가 픽업 날짜보다 빠릅니다.")
+
+    holidays = set(holidays if holidays is not None else get_holiday_dates())
+    cursor = start
+    billable_dates = []
+    while cursor <= end:
+        if cursor.weekday() != 6 and cursor.isoformat() not in holidays:
+            billable_dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+
+    extra_days = max(0, len(billable_dates) - 3)
+    return {
+        "pickup_date": pickup_s,
+        "return_date": return_s,
+        "stay_nights": max((end - start).days, 0),
+        "billable_days": len(billable_dates),
+        "billable_dates": billable_dates,
+        "base_days": min(len(billable_dates), 3),
+        "extra_days": extra_days,
+        "overnight_rate": 0.10,
+        "base_multiplier": 1,
+        "multiplier": 1 + (extra_days * 0.10),
+    }
+
+
+def quote_price_multiplier(pickup_date, return_date):
+    try:
+        return rental_pricing_context(pickup_date, return_date)["multiplier"]
+    except Exception:
+        return 1
+
+
+def calculate_line_total(quantity, unit_price, pickup_date=None, return_date=None, multiplier=None):
+    """상품 행 금액은 연박을 포함하지 않는 기본 공급가만 저장한다."""
+    return max(safe_int(quantity, 1), 1) * max(safe_int(unit_price, 0), 0)
+
+
+def calculate_overtime_amount(quantity, unit_price, pickup_date, return_date):
+    try:
+        ctx = rental_pricing_context(pickup_date, return_date)
+        base = calculate_line_total(quantity, unit_price)
+        return int(round(base * 0.10 * safe_int(ctx.get("extra_days", 0), 0)))
+    except Exception:
+        return 0
+
+
+def pricing_summary_text(pickup_date, return_date):
+    try:
+        ctx = rental_pricing_context(pickup_date, return_date)
+        extra = safe_int(ctx.get("extra_days", 0), 0)
+        billable = safe_int(ctx.get("billable_days", 0), 0)
+        if extra:
+            return f"요금 기준: 일요일/휴일 제외 {billable}일 청구 · 기본 2박3일 + 연박 {extra}일 · 연박 10%/일"
+        return f"요금 기준: 일요일/휴일 제외 {billable}일 청구 · 기본 2박3일 요금"
+    except Exception:
+        return "날짜를 입력하면 요금 기준이 계산됩니다."
+
+
+def item_availability_for_quote(item, quote):
+    """견적서 표시용 상태. 현재 견적 자기 자신은 재고 충돌에서 제외한다."""
+    try:
+        product_no = str(item.get("product_no"))
+        item_pickup, item_return = get_item_dates(item, quote)
+        status_one = bulk_product_status((product_no,), item_pickup, item_return, int(quote.get("quote_id", 0))).get(product_no, {})
+        reserved = safe_int(status_one.get("reserved", 0), 0)
+        pending = safe_int(status_one.get("pending", 0), 0)
+        if reserved > 0:
+            return "불가", reserved, pending
+        if pending > 0:
+            return "견적중", reserved, pending
+        return "가능", reserved, pending
+    except Exception:
+        return "가능", 0, 0
+
+
+def quote_financials(quote_id, include_only_priceable=True):
+    quote = get_quote(quote_id)
+    if not quote:
+        return {
+            "subtotal": 0, "overnight": 0, "vat": 0, "dc_label": "", "dc_amount": 0,
+            "total": 0, "items": [], "billable_days": 0, "extra_days": 0,
+        }
+    items = load_quote_items_df(quote_id)
+    subtotal = 0
+    overnight = 0
+    item_infos = []
+    for _, item in items.iterrows():
+        item_dict = dict(item)
+        qty = max(safe_int(item_dict.get("quantity", 1), 1), 1)
+        unit = max(safe_int(item_dict.get("unit_price", 0), 0), 0)
+        item_pickup, item_return = get_item_dates(item_dict, quote)
+        base = calculate_line_total(qty, unit)
+        extra = calculate_overtime_amount(qty, unit, item_pickup, item_return)
+        state, reserved, pending = item_availability_for_quote(item_dict, quote)
+        # 견적중 상태에서는 불가/견적중 상품을 최종가에서 제외한다. 확정 후에는 확정 품목을 기준으로 산출한다.
+        priceable = not (str(quote.get("status")) == "견적중" and state in ["불가", "견적중"])
+        if priceable or not include_only_priceable:
+            subtotal += base
+            overnight += extra
+        item_infos.append({
+            "item": item_dict,
+            "quantity": qty,
+            "unit_price": unit,
+            "base": base,
+            "overnight": extra,
+            "pickup_date": item_pickup,
+            "return_date": item_return,
+            "state": state,
+            "reserved": reserved,
+            "pending": pending,
+            "priceable": priceable,
+            "ctx": rental_pricing_context(item_pickup, item_return),
+        })
+    vat_base = subtotal + overnight
+    vat = int(round(vat_base * 0.1))
+    dc_label, dc_amount = quote_discount_info(quote)
+    dc_amount = min(max(dc_amount, 0), vat_base + vat)
+    total = max(vat_base + vat - dc_amount, 0)
+    try:
+        header_ctx = rental_pricing_context(quote.get("pickup_date"), quote.get("return_date"))
+    except Exception:
+        header_ctx = {"billable_days": 0, "extra_days": 0}
+    return {
+        "subtotal": int(subtotal),
+        "overnight": int(overnight),
+        "vat": int(vat),
+        "dc_label": dc_label,
+        "dc_amount": int(dc_amount),
+        "total": int(total),
+        "items": item_infos,
+        "billable_days": safe_int(header_ctx.get("billable_days", 0), 0),
+        "extra_days": safe_int(header_ctx.get("extra_days", 0), 0),
+    }
+
+
+def update_quote_totals(quote_id, reprice=True, clear_cache=True):
+    quote = get_quote(quote_id)
+    if not quote:
+        return
+    client = supabase_client()
+    items = load_quote_items_df(quote_id)
+    if reprice and not items.empty:
+        for _, item in items.iterrows():
+            qty = max(safe_int(item.get("quantity", 1), 1), 1)
+            unit = max(safe_int(item.get("unit_price", 0), 0), 0)
+            base = calculate_line_total(qty, unit)
+            if base != safe_int(item.get("line_total", 0), 0):
+                client.table("quote_items").update({
+                    "line_total": base,
+                    "updated_at": datetime.now().isoformat(),
+                }).eq("id", int(item["id"])).execute()
+    totals = quote_financials(quote_id, include_only_priceable=True)
+    client.table("quotes").update({
+        "subtotal": totals["subtotal"],
+        "vat": totals["vat"],
+        "total": totals["total"],
+        "updated_at": datetime.now().isoformat(),
+    }).eq("quote_id", int(quote_id)).execute()
+    if clear_cache:
+        clear_quote_cache()
+
+
+def create_quote(team_name, pickup_date, return_date, selected_items, memo="", dc_label="", dc_amount=0):
+    pickup = normalize_date_text(pickup_date)
+    ret = normalize_date_text(return_date)
+    quote_no = generate_quote_no()
+    client = supabase_client()
+    res = client.table("quotes").insert({
+        "quote_no": quote_no,
+        "team_name": team_name,
+        "pickup_date": pickup,
+        "return_date": ret,
+        "status": "견적중",
+        "subtotal": 0,
+        "vat": 0,
+        "total": 0,
+        "memo": build_quote_meta(memo, dc_label, dc_amount),
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }).execute()
+    quote_id = int(res.data[0]["quote_id"])
+
+    rows = []
+    for product_no, item in selected_items.items():
+        p = get_product(product_no)
+        if not p:
+            continue
+        qty = safe_int(item.get("quantity", 1), 1)
+        unit_price = safe_int(item.get("unit_price", p.get("price", 0)), 0)
+        rows.append({
+            "quote_id": quote_id,
+            "product_no": str(product_no),
+            "product_name": p.get("name", ""),
+            "size_text": p.get("size_text", ""),
+            "thumbnail_url": p.get("thumbnail_url", ""),
+            "local_thumbnail_path": p.get("local_thumbnail_path", ""),
+            "quantity": qty,
+            "unit_price": unit_price,
+            "line_total": calculate_line_total(qty, unit_price),
+            "availability_note": make_item_note(pickup, ret),
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        })
+    if rows:
+        client.table("quote_items").insert(rows).execute()
+    update_quote_totals(quote_id, reprice=False)
+    clear_quote_cache()
+    return quote_id
+
+
+def set_all_quote_item_dates(quote_id, pickup_date, return_date, reprice=True):
+    quote = get_quote(quote_id)
+    if not quote:
+        return
+    items = load_quote_items_df(quote_id)
+    client = supabase_client()
+    pickup = normalize_date_text(pickup_date)
+    ret = normalize_date_text(return_date)
+    for _, item in items.iterrows():
+        qty = max(safe_int(item.get("quantity", 1), 1), 1)
+        unit_price = max(safe_int(item.get("unit_price", 0), 0), 0)
+        payload = {
+            "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
+            "line_total": calculate_line_total(qty, unit_price),
+            "updated_at": datetime.now().isoformat(),
+        }
+        client.table("quote_items").update(payload).eq("id", int(item["id"])).execute()
+
+
+def update_quote_item(item_id, quantity, unit_price):
+    client = supabase_client()
+    item_rows = client.table("quote_items").select("quote_id,product_no,availability_note").eq("id", int(item_id)).limit(1).execute().data or []
+    if not item_rows:
+        return False, "견적 상품을 찾지 못했습니다."
+    quote_id = int(item_rows[0]["quote_id"])
+    product_no = str(item_rows[0].get("product_no", ""))
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, message
+    product = get_product(product_no) or {}
+    max_qty = max(safe_int(product.get("qty", 1), 1), 1)
+    qty = max(safe_int(quantity, 1), 1)
+    if qty > max_qty:
+        return False, f"보유수량이 {max_qty}개입니다."
+    price = max(safe_int(unit_price, 0), 0)
+    client.table("quote_items").update({
+        "quantity": qty,
+        "unit_price": price,
+        "line_total": calculate_line_total(qty, price),
+        "updated_at": datetime.now().isoformat(),
+    }).eq("id", int(item_id)).execute()
+    update_quote_totals(quote_id, reprice=False)
+    clear_quote_cache()
+    return True, message or "상품 정보를 변경했습니다."
+
+
+def update_quote_item_dates(item_id, quote_id, pickup_date, return_date):
+    try:
+        pickup = normalize_date_text(pickup_date)
+        ret = normalize_date_text(return_date)
+    except Exception as e:
+        return False, [str(e)]
+    if ret < pickup:
+        return False, ["반납 날짜가 픽업 날짜보다 빠릅니다."]
+    quote = get_quote(quote_id)
+    if not quote:
+        return False, ["견적서를 찾지 못했습니다."]
+    item_rows = supabase_client().table("quote_items").select("*").eq("id", int(item_id)).limit(1).execute().data or []
+    if not item_rows:
+        return False, ["견적 상품을 찾지 못했습니다."]
+    item = item_rows[0]
+    product_no = str(item.get("product_no", ""))
+    product = get_product(product_no) or {}
+    total_qty = max(safe_int(product.get("qty", 1), 1), 1)
+    qty = max(safe_int(item.get("quantity", 1), 1), 1)
+    if qty > total_qty:
+        return False, [f"보유수량이 {total_qty}개입니다."]
+    ok, message = reopen_quote_for_edit(quote_id)
+    if not ok:
+        return False, [message]
+    supabase_client().table("quote_items").update({
+        "availability_note": make_item_note(pickup, ret, item.get("availability_note", "")),
+        "line_total": calculate_line_total(qty, safe_int(item.get("unit_price", 0), 0)),
+        "updated_at": datetime.now().isoformat(),
+    }).eq("id", int(item_id)).execute()
+    update_quote_date_range_from_items(quote_id)
+    update_quote_totals(quote_id, reprice=False)
+    clear_quote_cache()
+    return True, ([message] if message else [])
+
+
+def render_quote_detail_header(quote):
+    status = valid_status_text(quote.get("status")) or "견적중"
+    created = format_datetime_short(quote.get("created_at"))
+    totals = quote_financials(int(quote.get("quote_id")))
+    st.markdown(f"""
+    <div class='quote-detail-head'>
+        <div class='quote-status-line'>{status_badge(status, status_kind(status))}</div>
+        <div class='quote-title-line'>{escape(str(quote.get('quote_no', '')))} / {escape(str(quote.get('team_name', '')))}</div>
+        <div class='quote-meta-grid'>
+            <div><span>픽업</span><strong>{escape(str(quote.get('pickup_date', '')))}</strong></div>
+            <div><span>반납</span><strong>{escape(str(quote.get('return_date', '')))}</strong></div>
+            <div><span>공급가</span><strong>{escape(money(totals.get('subtotal', 0)))}</strong></div>
+            <div><span>연박</span><strong>{escape(money(totals.get('overnight', 0)))}</strong></div>
+            <div><span>총액</span><strong>{escape(money(totals.get('total', 0)))}</strong></div>
+            <div><span>작성일</span><strong>{escape(created or '-')}</strong></div>
+        </div>
+        <div class='quote-pricing-line'>{escape(pricing_summary_text(quote.get('pickup_date'), quote.get('return_date')))}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def quote_status_label_for_image(item_info, quote):
+    if str(quote.get("status")) != "견적중":
+        return ""
+    state = item_info.get("state", "가능")
+    if state == "불가":
+        return "불가"
+    if state == "견적중":
+        return "견적중"
+    return ""
+
+
+def draw_quote_product_card(draw, canvas, box, item_info, quote, fonts):
+    x, y, w, h = box
+    item = item_info["item"]
+    state_label = quote_status_label_for_image(item_info, quote)
+    priceable = item_info.get("priceable", True)
+    draw.rounded_rectangle((x, y, x + w, y + h), radius=16, outline=(218, 218, 218), width=2, fill=(252, 252, 252))
+    if state_label:
+        fill = (253, 236, 236) if state_label == "불가" else (255, 241, 204)
+        outline = (210, 60, 50) if state_label == "불가" else (210, 120, 0)
+        draw.rounded_rectangle((x + 14, y + 12, x + 100, y + 42), radius=12, fill=fill, outline=outline, width=1)
+        draw.text((x + 30, y + 18), state_label, font=fonts["xs_b"], fill=outline)
+        if not priceable:
+            draw.text((x + 110, y + 18), "총액 제외", font=fonts["xs"], fill=(150, 70, 70))
+    thumb_y = y + 50
+    thumb_box = (x + 18, thumb_y, x + w - 18, thumb_y + 128)
+    draw.rounded_rectangle(thumb_box, radius=14, fill=(244, 244, 244))
+    thumb = open_thumb(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
+    if thumb:
+        thumb.thumbnail((thumb_box[2] - thumb_box[0] - 12, thumb_box[3] - thumb_box[1] - 12))
+        tx = thumb_box[0] + ((thumb_box[2] - thumb_box[0]) - thumb.width) // 2
+        ty = thumb_box[1] + ((thumb_box[3] - thumb_box[1]) - thumb.height) // 2
+        canvas.paste(thumb, (tx, ty))
+    text_x = x + 18
+    ty = thumb_box[3] + 12
+    draw_fit_text(draw, (text_x, ty), item.get("product_name", ""), fonts["s_b"], fill=(20,20,20), max_width=w - 36)
+    draw_fit_text(draw, (text_x, ty + 30), item.get("size_text", ""), fonts["xs"], fill=(90,90,90), max_width=w - 36)
+    draw.text((text_x, ty + 60), f"{item_info['quantity']}EA x {money(item_info['unit_price'])}", font=fonts["xs"], fill=(80,80,80))
+    draw.text((text_x, ty + 88), money(item_info["base"]), font=fonts["s_b"], fill=(20,20,20))
+
+
+def make_quote_page_images(quote_id):
+    quote = get_quote(quote_id)
+    if not quote:
+        raise ValueError("견적서를 찾을 수 없습니다.")
+    totals = quote_financials(quote_id, include_only_priceable=True)
+    items = totals.get("items", [])
+    pages = [items[i:i+10] for i in range(0, len(items), 10)] or [[]]
+    out_pages = []
+    width, height = 1600, 900
+    margin = 70
+    fonts = {
+        "logo": load_font(62, bold=True),
+        "title": load_font(42, bold=True),
+        "h": load_font(28, bold=True),
+        "m": load_font(22),
+        "m_b": load_font(22, bold=True),
+        "s": load_font(18),
+        "s_b": load_font(18, bold=True),
+        "xs": load_font(15),
+        "xs_b": load_font(15, bold=True),
+    }
+    for page_idx, page_items in enumerate(pages):
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((margin, 38), "프라비", font=fonts["logo"], fill=(0,0,0))
+        title = "견적서"
+        tw, _ = text_size(draw, title, fonts["title"])
+        draw.text((width - margin - tw, 54), title, font=fonts["title"], fill=(20,20,20))
+        line_y = 125
+        draw.line((margin, line_y, width - margin, line_y), fill=(35,35,35), width=2)
+        if page_idx == 0:
+            info_y = 150
+            draw.text((margin, info_y), f"팀 이름: {quote.get('team_name','')}", font=fonts["h"], fill=(25,25,25))
+            draw.text((margin, info_y + 42), f"픽업: {quote.get('pickup_date','')}", font=fonts["m"], fill=(60,60,60))
+            draw.text((margin + 260, info_y + 42), f"반납: {quote.get('return_date','')}", font=fonts["m"], fill=(60,60,60))
+            price_x = width - margin - 400
+            py = info_y - 2
+            draw.text((price_x, py), "공급가", font=fonts["m"], fill=(60,60,60)); draw.text((price_x+210, py), money(totals['subtotal']), font=fonts["m_b"], fill=(20,20,20))
+            draw.text((price_x, py+36), f"연박 {totals['extra_days']}일", font=fonts["m"], fill=(60,60,60)); draw.text((price_x+210, py+36), money(totals['overnight']), font=fonts["m_b"], fill=(20,20,20))
+            draw.text((price_x, py+72), "부가세", font=fonts["m"], fill=(60,60,60)); draw.text((price_x+210, py+72), money(totals['vat']), font=fonts["m_b"], fill=(20,20,20))
+            if totals.get('dc_amount'):
+                dc_label = totals.get('dc_label') or 'D.C'
+                draw.text((price_x, py+108), dc_label, font=fonts["m"], fill=(220,40,40)); draw.text((price_x+210, py+108), f"-{money(totals['dc_amount'])}", font=fonts["m_b"], fill=(220,40,40))
+                total_y = py + 150
+            else:
+                total_y = py + 120
+            draw.line((price_x, total_y-8, width-margin, total_y-8), fill=(220,220,220), width=2)
+            draw.text((price_x, total_y), "총금액", font=fonts["h"], fill=(0,0,0)); draw.text((price_x+210, total_y), money(totals['total']), font=fonts["h"], fill=(0,0,0))
+            grid_top = 315
+        else:
+            small = f"{quote.get('team_name','')} · {quote.get('pickup_date','')} ~ {quote.get('return_date','')} · {page_idx+1}/{len(pages)}"
+            draw.text((margin, 150), small, font=fonts["m"], fill=(90,90,90))
+            grid_top = 200
+        cols, rows = 5, 2
+        gap_x, gap_y = 22, 26
+        card_w = int((width - margin*2 - gap_x*(cols-1)) / cols)
+        card_h = 250
+        for idx, item_info in enumerate(page_items):
+            col = idx % cols
+            row = idx // cols
+            x = margin + col*(card_w + gap_x)
+            y = grid_top + row*(card_h + gap_y)
+            draw_quote_product_card(draw, img, (x, y, card_w, card_h), item_info, quote, fonts)
+        out_pages.append(img)
+    return out_pages
+
+
+def make_quote_image_bytes(quote_id):
+    img = make_quote_page_images(quote_id)[0]
+    out = BytesIO(); img.save(out, format="PNG"); out.seek(0); return out.getvalue()
+
+
+def make_quote_png_bundle_bytes(quote_id):
+    pages = make_quote_page_images(quote_id)
+    if len(pages) == 1:
+        out = BytesIO(); pages[0].save(out, format="PNG"); out.seek(0); return out.getvalue(), "png"
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, page in enumerate(pages, start=1):
+            bio = BytesIO(); page.save(bio, format="PNG"); z.writestr(f"quote_page_{i:02d}.png", bio.getvalue())
+    out.seek(0)
+    return out.getvalue(), "zip"
+
+
+def make_quote_pdf_bytes(quote_id):
+    pages = make_quote_page_images(quote_id)
+    images = [p.convert("RGB") for p in pages]
+    out = BytesIO()
+    images[0].save(out, format="PDF", resolution=150.0, save_all=True, append_images=images[1:])
+    out.seek(0)
+    return out.getvalue()
+
+
+def make_invoice_image_bytes(quote_id):
+    quote = get_quote(quote_id)
+    if not quote:
+        raise ValueError("견적서를 찾을 수 없습니다.")
+    totals = quote_financials(quote_id, include_only_priceable=False)
+    items = totals.get("items", [])
+    width = 1200
+    row_h = 42
+    height = 420 + max(1, len(items)) * row_h
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    f_logo = load_font(44, True); f_h = load_font(24, True); f_m = load_font(18); f_s = load_font(15)
+    x0 = 22; y = 20
+    draw.text((x0, y), "프라비 견적서", font=f_logo, fill=(0,0,0))
+    draw.text((440, y), "공급자", font=f_m, fill=(0,0,0))
+    supplier = ["상호  프라비(PROP.B)      대표자  이승훈", "등록번호  772-01-02018", "주소  경기도 남양주시 진접읍 금곡리45", "전화  0507-1390-3668"]
+    for i, line in enumerate(supplier):
+        draw.text((520, y + i*34), line, font=f_s, fill=(30,30,30))
+    y += 110
+    draw.text((x0, y), f"픽업일     {quote.get('pickup_date','')}", font=f_s, fill=(0,0,0))
+    draw.text((x0, y+30), f"반납일     {quote.get('return_date','')}", font=f_s, fill=(0,0,0))
+    draw.text((x0, y+60), f"팀명       {quote.get('team_name','')}", font=f_s, fill=(0,0,0))
+    draw.rectangle((0, y+100, width, y+155), fill=(244,244,244))
+    draw.text((x0, y+114), "총금액 (공급가액 + 세액)", font=f_h, fill=(0,0,0))
+    total_text = money(totals['total'])
+    tw, _ = text_size(draw, total_text, f_h)
+    draw.text((width-40-tw, y+114), total_text, font=f_h, fill=(0,0,0))
+    y += 180
+    headers = ["품명", "개당가격", "주문수량", "공급가액", "세액"]
+    xs = [30, 420, 610, 760, 980]
+    draw.rectangle((0, y, width, y+row_h), fill=(244,244,244))
+    for h, xx in zip(headers, xs): draw.text((xx, y+12), h, font=f_s, fill=(0,0,0))
+    y += row_h
+    for info in items:
+        item = info['item']; qty=info['quantity']; unit=info['unit_price']; base=info['base']; vat=int(round((base+info['overnight'])*0.1))
+        draw.text((30, y+12), str(item.get('product_name',''))[:34], font=f_s, fill=(0,0,0))
+        draw.text((420, y+12), f"{unit:,}", font=f_s, fill=(0,0,0))
+        draw.text((610, y+12), str(qty), font=f_s, fill=(0,0,0))
+        draw.text((760, y+12), f"{base:,}", font=f_s, fill=(0,0,0))
+        draw.text((980, y+12), f"{vat:,}", font=f_s, fill=(0,0,0))
+        draw.line((0, y+row_h, width, y+row_h), fill=(225,225,225), width=1)
+        y += row_h
+    y += 12
+    draw.rectangle((0, y, width, y+92), fill=(244,244,244))
+    draw.text((500, y+18), f"합계 {money(totals['subtotal'])}", font=f_s, fill=(0,0,0))
+    draw.text((760, y+18), f"연박 {money(totals['overnight'])}", font=f_s, fill=(0,0,0))
+    draw.text((980, y+18), f"세액 {money(totals['vat'])}", font=f_s, fill=(0,0,0))
+    draw.text((x0, y+110), "입금계좌: 국민은행 / 618301-01-466485 / 이승훈", font=f_h, fill=(0,0,0))
+    draw.text((x0, y+150), "E-mail : propb.come@gmail.com", font=f_h, fill=(0,0,0))
+    out = BytesIO(); img.save(out, format="PNG"); out.seek(0); return out.getvalue()
+
+
+def make_invoice_pdf_bytes(quote_id):
+    png = make_invoice_image_bytes(quote_id)
+    img = Image.open(BytesIO(png)).convert("RGB")
+    out = BytesIO(); img.save(out, format="PDF", resolution=150.0); out.seek(0); return out.getvalue()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_quote_pdf_bytes_v2(quote_id, signature):
+    return make_quote_pdf_bytes(quote_id)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_quote_png_bundle_bytes_v2(quote_id, signature):
+    return make_quote_png_bundle_bytes(quote_id)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_invoice_pdf_bytes_v2(quote_id, signature):
+    return make_invoice_pdf_bytes(quote_id)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_invoice_png_bytes_v2(quote_id, signature):
+    return make_invoice_image_bytes(quote_id)
+
+
+def render_quote_export_buttons(quote_id, key_prefix="quote_export"):
+    signature = quote_export_signature(quote_id)
+    quote = get_quote(quote_id) or {}
+    st.caption("파일 생성 버튼을 누른 뒤 다운로드됩니다. 큰 견적서는 처음 생성할 때만 시간이 걸릴 수 있습니다.")
+    c1, c2 = st.columns(2)
+    pdf_key = f"{key_prefix}_{quote_id}_{signature}_pdf_v2"
+    png_key = f"{key_prefix}_{quote_id}_{signature}_png_v2"
+    with c1:
+        if st.button("PDF 파일 생성", use_container_width=True, key=f"{key_prefix}_make_pdf_v2_{quote_id}_{signature}"):
+            with st.spinner("PDF 생성 중..."):
+                st.session_state[pdf_key] = cached_quote_pdf_bytes_v2(quote_id, signature)
+        if pdf_key in st.session_state:
+            st.download_button("PDF 다운로드", data=st.session_state[pdf_key], file_name=quote_filename(quote_id, "pdf"), mime="application/pdf", use_container_width=True, key=f"{key_prefix}_download_pdf_v2_{quote_id}_{signature}")
+    with c2:
+        if st.button("PNG 파일 생성", use_container_width=True, key=f"{key_prefix}_make_png_v2_{quote_id}_{signature}"):
+            with st.spinner("PNG 생성 중..."):
+                st.session_state[png_key] = cached_quote_png_bundle_bytes_v2(quote_id, signature)
+        if png_key in st.session_state:
+            data, kind = st.session_state[png_key]
+            if kind == "zip":
+                st.download_button("PNG ZIP 다운로드", data=data, file_name=quote_filename(quote_id, "zip"), mime="application/zip", use_container_width=True, key=f"{key_prefix}_download_png_zip_v2_{quote_id}_{signature}")
+            else:
+                st.download_button("PNG 다운로드", data=data, file_name=quote_filename(quote_id, "png"), mime="image/png", use_container_width=True, key=f"{key_prefix}_download_png_v2_{quote_id}_{signature}")
+    if str(quote.get("status")) in ["확정", "부분반납", "반납완료"]:
+        st.markdown("#### 확정용 거래명세서")
+        i1, i2 = st.columns(2)
+        inv_pdf_key = f"{key_prefix}_{quote_id}_{signature}_invoice_pdf"
+        inv_png_key = f"{key_prefix}_{quote_id}_{signature}_invoice_png"
+        with i1:
+            if st.button("거래명세서 PDF 생성", use_container_width=True, key=f"{key_prefix}_make_invoice_pdf_{quote_id}_{signature}"):
+                with st.spinner("거래명세서 PDF 생성 중..."):
+                    st.session_state[inv_pdf_key] = cached_invoice_pdf_bytes_v2(quote_id, signature)
+            if inv_pdf_key in st.session_state:
+                st.download_button("거래명세서 PDF 다운로드", data=st.session_state[inv_pdf_key], file_name=f"프라비_거래명세서_{quote.get('quote_no','')}.pdf", mime="application/pdf", use_container_width=True, key=f"{key_prefix}_download_invoice_pdf_{quote_id}_{signature}")
+        with i2:
+            if st.button("거래명세서 PNG 생성", use_container_width=True, key=f"{key_prefix}_make_invoice_png_{quote_id}_{signature}"):
+                with st.spinner("거래명세서 PNG 생성 중..."):
+                    st.session_state[inv_png_key] = cached_invoice_png_bytes_v2(quote_id, signature)
+            if inv_png_key in st.session_state:
+                st.download_button("거래명세서 PNG 다운로드", data=st.session_state[inv_png_key], file_name=f"프라비_거래명세서_{quote.get('quote_no','')}.png", mime="image/png", use_container_width=True, key=f"{key_prefix}_download_invoice_png_{quote_id}_{signature}")
+
+
+def page_quote_create():
+    init_current_quote_state()
+    st.header("견적서 만들기")
+    st.caption("* 필수 입력")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([1, 1, 1.15, 1.15])
+        with c1:
+            team_name = st.text_input("팀", key="create_team_name", placeholder="팀 이름 입력")
+        with c2:
+            person_name = st.text_input("사람", key="create_person_name", placeholder="사람 이름 입력")
+        with c3:
+            pickup_raw = st.text_input("픽업 날짜", value="", help=date_input_help(), key="create_pickup_text", placeholder="픽업 날짜 입력")
+        with c4:
+            return_raw = st.text_input("반납 날짜", value="", help=date_input_help(), key="create_return_text", placeholder="반납 날짜 입력")
+    pickup_date = try_normalize_date_text(pickup_raw)
+    return_date = try_normalize_date_text(return_raw)
+    date_error = ""
+    if pickup_raw.strip() and not pickup_date:
+        date_error = "픽업 날짜 형식을 확인하세요."
+    elif return_raw.strip() and not return_date:
+        date_error = "반납 날짜 형식을 확인하세요."
+    elif pickup_date and return_date and return_date < pickup_date:
+        date_error = "반납 날짜가 픽업 날짜보다 빠릅니다."
+    if date_error:
+        st.warning(date_error)
+    elif pickup_date and return_date:
+        st.caption(pricing_summary_text(pickup_date, return_date))
+    search = st.text_input("상품 검색", key="create_product_search", placeholder="상품명 입력")
+    st.subheader("상품 선택")
+    try:
+        st.caption(f"총 저장 상품 {count_products_fast(''):,}개")
+    except Exception:
+        pass
+    page_size = 20
+    if "create_product_page" not in st.session_state:
+        st.session_state["create_product_page"] = 1
+    reset_page_when_search_changes(search, "create_product_page", "create_product_search_tracker")
+    page_df, total_count = load_products_page(search_text=search, page=st.session_state["create_product_page"], page_size=page_size)
+    product_nos = tuple(page_df["product_no"].astype(str).tolist()) if not page_df.empty else tuple()
+    status_map = bulk_product_status(product_nos, pickup_date or "", return_date or "", 0)
+    cols = st.columns(4)
+    for i, (_, row) in enumerate(page_df.iterrows()):
+        product_no = str(row["product_no"])
+        selected = product_no in st.session_state["selected_quote_items"]
+        with cols[i % 4]:
+            clicked, _, _, _ = render_product_tile(row, key_prefix=f"create_{st.session_state['create_product_page']}_{i}_{product_no}", pickup_date=pickup_date or None, return_date=return_date or None, selected=selected, select_label="선택 해제" if selected else "선택", show_select=True, status_info=status_map.get(product_no, {"reserved": 0, "pending": 0}))
+            if clicked:
+                if selected:
+                    st.session_state["selected_quote_items"].pop(product_no, None)
+                    st.session_state.pop(f"create_qty_{product_no}_value", None)
+                else:
+                    add_to_current_selection(row)
+                st.rerun()
+    pagination_controls(total_count, page_size, "create_product_page")
+    st.divider()
+    st.subheader("선택된 상품")
+    selected_items = st.session_state["selected_quote_items"]
+    if not selected_items:
+        st.info("선택된 상품이 없습니다.")
+        return
+    with st.container(border=True):
+        st.markdown("**견적 정보**")
+        info_cols = st.columns(4)
+        info_cols[0].caption("팀"); info_cols[0].write(team_name or "-")
+        info_cols[1].caption("사람"); info_cols[1].write(person_name or "-")
+        info_cols[2].caption("픽업 날짜"); info_cols[2].write(pickup_date or "-")
+        info_cols[3].caption("반납 날짜"); info_cols[3].write(return_date or "-")
+        st.caption("상단 입력값과 자동으로 동기화됩니다. 수정은 상단 입력란에서 해주세요.")
+    selected_codes = tuple(str(x) for x in selected_items.keys())
+    selected_status = bulk_product_status(selected_codes, pickup_date or "", return_date or "", 0)
+    selected_product_map = load_products_map(selected_codes)
+    remove_codes = []
+    supply_preview = 0
+    overtime_preview = 0
+    for product_no, item in list(selected_items.items()):
+        product = selected_product_map.get(str(product_no)) or {}
+        stock_qty = max(safe_int(item.get("stock_qty", product.get("qty", 1)), 1), 1)
+        selected_items[product_no]["stock_qty"] = stock_qty
+        state_reserved = safe_int(selected_status.get(product_no, {}).get("reserved", 0), 0)
+        state_pending = safe_int(selected_status.get(product_no, {}).get("pending", 0), 0)
+        priceable = not (state_reserved > 0 or state_pending > 0)
+        with st.container(border=True):
+            render_status_button_bar(product_no, pickup_date or None, return_date or None, key_prefix=f"selected_status_{product_no}", precomputed=selected_status.get(product_no, {"reserved": 0, "pending": 0}), total_qty_override=stock_qty)
+            cc1, cc2, cc3, cc4, cc5 = st.columns([1.1, 2.7, 1.4, 1.4, 0.8])
+            with cc1:
+                show_thumb_from_values(item.get("thumbnail_path", ""), item.get("thumbnail_url", ""))
+            with cc2:
+                st.markdown(f"**{item.get('name', '')}**")
+                st.caption(item.get("size_text", ""))
+                st.caption(f"상품번호: {product_no}")
+                st.caption(f"보유수량: {stock_qty}개")
+                if not priceable:
+                    st.caption("불가/견적중 상품은 견적 총액에서 제외됩니다.")
+            with cc3:
+                qty = render_quantity_stepper("수량", item.get("quantity", 1), stock_qty, f"create_qty_{product_no}")
+                selected_items[product_no]["quantity"] = qty
+            with cc4:
+                price = st.number_input("단가", min_value=0, value=safe_int(item.get("unit_price", 0), 0), step=1000, key=f"create_price_{product_no}")
+                selected_items[product_no]["unit_price"] = price
+                base = calculate_line_total(qty, price)
+                extra = calculate_overtime_amount(qty, price, pickup_date, return_date) if pickup_date and return_date else 0
+                st.caption(f"상품금액: {money(base)}")
+                if pickup_date and return_date:
+                    st.caption(f"연박: {money(extra)}")
+                if priceable:
+                    supply_preview += base
+                    overtime_preview += extra
+            with cc5:
+                if st.button("삭제", key=f"create_remove_{product_no}"):
+                    remove_codes.append(product_no)
+    for code in remove_codes:
+        selected_items.pop(code, None)
+        st.session_state.pop(f"create_qty_{code}_value", None)
+        st.rerun()
+    dc_cols = st.columns([1.2, 1.0, 2.8])
+    with dc_cols[0]:
+        dc_label = st.text_input("D.C 문구", key="create_dc_label", placeholder="예: 기종할인50% D.C")
+    with dc_cols[1]:
+        dc_amount = st.number_input("D.C 금액", min_value=0, value=0, step=1000, key="create_dc_amount")
+    with dc_cols[2]:
+        memo = st.text_input("견적 메모", key="create_memo")
+    vat_preview = int(round((supply_preview + overtime_preview) * 0.1))
+    total_preview = max(supply_preview + overtime_preview + vat_preview - safe_int(dc_amount, 0), 0)
+    summary = f"공급가 {money(supply_preview)} / 연박 {money(overtime_preview)} / 부가세 {money(vat_preview)}"
+    if safe_int(dc_amount, 0):
+        summary += f" / D.C -{money(dc_amount)}"
+    summary += f" / 총금액 {money(total_preview)}"
+    st.markdown(f"### 합계: {summary}")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("견적서 만들기", type="primary", use_container_width=True):
+            if not team_name.strip() or not person_name.strip():
+                st.error("팀과 사람 이름을 모두 입력해야 합니다.")
+            elif date_error or not pickup_date or not return_date:
+                st.error(date_error or "픽업/반납 날짜를 입력해야 합니다.")
+            else:
+                quote_id = create_quote(combine_team_person(team_name, person_name), pickup_date, return_date, selected_items, memo, dc_label, dc_amount)
+                st.session_state["selected_quote_items"] = {}
+                st.session_state["last_created_quote_id"] = quote_id
+                st.success("견적서를 저장했습니다.")
+                st.rerun()
+    with c2:
+        if st.button("선택 초기화", use_container_width=True):
+            for code in list(st.session_state.get("selected_quote_items", {}).keys()):
+                st.session_state.pop(f"create_qty_{code}_value", None)
+            st.session_state["selected_quote_items"] = {}
+            st.rerun()
+    last_id = st.session_state.get("last_created_quote_id")
+    if last_id and get_quote(last_id):
+        st.divider()
+        st.subheader("방금 만든 견적서 다운로드")
+        render_quote_export_buttons(last_id, key_prefix="created_quote_export")
+
+
 # -----------------------------
 # 앱 시작
 # -----------------------------
